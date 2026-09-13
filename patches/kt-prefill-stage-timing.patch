@@ -1,0 +1,91 @@
+diff --git a/kt-kernel/operators/avx2/moe_base.hpp b/kt-kernel/operators/avx2/moe_base.hpp
+index 3b1471f..4e24988 100644
+--- a/kt-kernel/operators/avx2/moe_base.hpp
++++ b/kt-kernel/operators/avx2/moe_base.hpp
+@@ -191,9 +191,21 @@ class AVX2_MOE_BASE {
+     derived_const()->write_weights_to_buffer(std::forward<Args>(args)...);
+   }
+ 
++  static bool stage_timing_enabled() {
++    static const bool on = getenv("KT_PREFILL_STAGE_TIMING") != nullptr;
++    return on;
++  }
++  static double stage_now_ms() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
++
+   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
+                        void* output) {
+     auto pool = config_.pool->get_subpool(tp_part_idx);
++    const bool st_on = stage_timing_enabled();
++    double st_t[8]; int st_i = 0;
++    auto st_mark = [&]() { if (st_on) st_t[st_i++] = stage_now_ms(); };
++    st_mark();
+ 
+     int activated_expert = 0;
+     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+@@ -270,6 +282,7 @@ class AVX2_MOE_BASE {
+       }
+     };
+ 
++    st_mark();  // 1: routing bookkeeping + buffer carve
+     // Copy input to per-expert buffers
+     direct_or_pool(qlen, [&](int i) {
+       for (int j = 0; j < k; j++) {
+@@ -279,12 +292,14 @@ class AVX2_MOE_BASE {
+       }
+     });
+ 
++    st_mark();  // 2: copy_input
+     // Pack input into BufferA (trivial memcpy for AVX2)
+     direct_or_pool(activated_expert, [this](int task_id) {
+       int expert_idx = m_expert_id_map_[task_id];
+       gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+     });
+ 
++    st_mark();  // 3: pack
+     if constexpr (has_fused_prefill()) {
+       if (activated_expert > 0) run_fused_prefill(activated_expert, qlen);
+     } else {
+@@ -306,8 +321,10 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+ 
++      st_mark();  // 4: gate/up gemm
+       // Activation: SiLU(gate) * up — AVX2 version (8 elements at a time)
+       apply_activation(activated_expert, nth, qlen);
++      st_mark();  // 5: activation
+ 
+       // Pack activation output into BufferA for down projection
+       pool->do_work_stealing_job(
+@@ -318,6 +335,7 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+ 
++      st_mark();  // 6: pack down
+       // Down GEMM
+       nth = T::recommended_nth(config_.hidden_size);
+       pool->do_work_stealing_job(
+@@ -331,6 +349,7 @@ class AVX2_MOE_BASE {
+           nullptr);
+     }
+ 
++    st_mark();  // 7: down gemm
+     // Weighted sum of expert outputs — AVX2 version (16 BF16 = 2x8 FP32 at a time)
+     pool->do_work_stealing_job(
+         qlen, nullptr,
+@@ -354,6 +373,14 @@ class AVX2_MOE_BASE {
+           }
+         },
+         nullptr);
++    if (st_on) {
++      st_t[st_i++] = stage_now_ms();
++      // rows per expert: total routed rows on this part / activated experts
++      size_t rows = 0; for (int i = 0; i < config_.expert_num; i++) rows += m_local_num_[i];
++      fprintf(stderr, "[kt-prefill-stage] tp%d layer%d qlen=%d experts=%d rows=%zu | bookkeep %.1f copy %.1f pack %.1f gateup %.1f act %.1f packdown %.1f down %.1f sum %.1f | total %.1f ms\n",
++              tp_part_idx, config_.layer_idx, qlen, activated_expert, rows,
++              st_t[1]-st_t[0], st_t[2]-st_t[1], st_t[3]-st_t[2], st_t[4]-st_t[3], st_t[5]-st_t[4], st_t[6]-st_t[5], st_t[7]-st_t[6], st_t[8]-st_t[7], st_t[8]-st_t[0]);
++    }
+   }
+ 
+   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {

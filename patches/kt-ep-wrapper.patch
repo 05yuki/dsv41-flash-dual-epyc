@@ -1,0 +1,163 @@
+diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+index 36c15cf1..78d557da 100644
+--- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
++++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+@@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
+ (using any quantization method) and CPU experts (using AMX/AVX instructions).
+ """
+ 
++import os
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Optional
+ 
+@@ -114,6 +115,38 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
+     return topk_ids
+ 
+ 
++_routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
++_gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
++_routing_state = {}
++
++
++def _routing_count(device, layer_idx, topk_ids, rank):
++    import threading
++    import time
++
++    st = _routing_state.get(device.index)
++    if st is None:
++        counts = torch.zeros((64, 512), dtype=torch.int32, device=device)
++        ones = torch.ones((1,), dtype=torch.int32, device=device)
++        st = _routing_state[device.index] = {"counts": counts, "ones": ones}
++
++        def dump():
++            while True:
++                time.sleep(30)
++                try:
++                    c = st["counts"].cpu()
++                    torch.save(
++                        {"rank": rank, "logical_count": c},
++                        f"{_routing_dump_prefix}-rank{rank}.pt",
++                    )
++                except Exception as e:  # never take the scheduler down for a dump
++                    print(f"[kt-routing] dump failed: {e}", flush=True)
++
++        threading.Thread(target=dump, daemon=True, name="kt-routing-dump").start()
++    ids = topk_ids.reshape(-1).to(torch.int64)
++    st["counts"][layer_idx].index_add_(0, ids, st["ones"].expand(ids.numel()))
++
++
+ class KTEPWrapperMethod(FusedMoEMethodBase):
+     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
+ 
+@@ -216,19 +249,32 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         # 2. Initialize KT wrapper for CPU experts
+         # CPU experts: num_gpu_experts to num_experts-1
+         if self.tp_rank == 0:
++            # kt-kernel 0.7.0 inference API takes an explicit boolean mask of
++            # GPU-resident experts instead of num_gpu_experts (SFT-only).
++            # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
++            gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
++            gpu_mask[: self.num_gpu_experts] = True
+             self.wrapper = KTMoEWrapper(
+                 layer_idx=self.kt_config.layer_idx,
+                 num_experts=num_experts,
+                 num_experts_per_tok=num_experts_per_tok,
+                 hidden_size=hidden_size,
+                 moe_intermediate_size=intermediate_size_full,
+-                num_gpu_experts=self.num_gpu_experts,
++                gpu_experts_mask=gpu_mask,
+                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
+                 threadpool_count=self.kt_config.threadpool_count,
+                 weight_path=self.kt_config.weight_path,
+                 chunked_prefill_size=self.kt_config.chunked_prefill_size,
+                 method=self.kt_config.method,
+                 max_deferred_experts_per_token=layer_max_deferred,
++                # KT_NUMA_NODES="1" pins a single pool to node 1, the node
++                # that does not host the TP0 scheduler, for the prefill-decay
++                # isolation; unset keeps kt-kernel's sequential default.
++                numa_nodes=(
++                    [int(x) for x in os.environ["KT_NUMA_NODES"].split(",")]
++                    if os.environ.get("KT_NUMA_NODES")
++                    else None
++                ),
+             )
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+@@ -297,6 +343,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         topk_output = dispatch_output.topk_output
+         topk_weights, topk_ids, _ = topk_output
+ 
++        # KT_ROUTING_DUMP=<prefix>: accumulate a [layers, experts] histogram of
++        # the routed expert ids on the GPU (a captured index_add_, so it keeps
++        # counting under CUDA graph replay) and save it as
++        # <prefix>-rank<r>.pt every 30 s. SGLang's expert distribution recorder
++        # never sees the V4 router's ids (09-13); this does.
++        if _routing_dump_prefix:
++            _routing_count(x.device, self.kt_config.layer_idx, topk_ids, self.tp_rank)
++
+         # Submit forward task to CPU (non-blocking)
+         self.wrapper.submit_forward(
+             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
+@@ -344,6 +398,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         x = dispatch_output.hidden_states
+         topk_output = dispatch_output.topk_output
++        # --init-expert-location moves experts between the GPU slots (physical
++        # 0..num_gpu_experts-1) and the CPU, and both weight loaders honour it,
++        # but the V4 router hands this wrapper *logical* ids (the topk remap in
++        # topk.py only runs with --enable-eplb). Remap here, once per layer,
++        # so a hot-expert placement actually routes to the GPU slots.
++        log2phy = self._logical_to_physical(x.device)
++        if log2phy is not None:
++            ids = topk_output.topk_ids
++            remapped = torch.where(ids >= 0, log2phy[ids.clamp(min=0)], ids).to(ids.dtype)
++            topk_output = topk_output._replace(topk_ids=remapped)
++            dispatch_output = dispatch_output._replace(topk_output=topk_output)
+ 
+         # Step 1: Submit CPU expert computation (non-blocking)
+         if self.tp_rank == 0:
+@@ -355,7 +420,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+         masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+ 
+         # Create modified dispatch output for GPU computation
+-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
++        if _gpu_mask_zero:
++            # KT_GPU_MASK_ZERO=1: the Marlin MoE path cannot take -1 ids (its
++            # alignment kernels index weights with them: illegal address at
++            # graph capture, 09-13). Send the CPU-bound rows to GPU expert 0
++            # with a zero routing weight instead — the second GEMM multiplies
++            # by the weight, so they add nothing — and hand the ids over as
++            # int64 so fused_marlin_moe takes its generic alignment path,
++            # which is fine with duplicate ids within a token.
++            m = masked_topk_ids < 0
++            masked_topk_output = topk_output._replace(
++                topk_ids=torch.where(m, torch.zeros_like(masked_topk_ids), masked_topk_ids).to(torch.int64),
++                topk_weights=torch.where(m, torch.zeros_like(topk_output.topk_weights), topk_output.topk_weights),
++            )
++        else:
++            masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+         masked_dispatch_output = dispatch_output._replace(
+             topk_output=masked_topk_output
+         )
+@@ -372,6 +451,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         return StandardCombineInput(hidden_states=output)
+ 
++    def _logical_to_physical(self, device):
++        cached = self.__dict__.get("_log2phy_cache", "unset")
++        if cached != "unset":
++            return cached
++        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
++
++        meta = get_global_expert_location_metadata()
++        table = None
++        if meta is not None:
++            m = meta.logical_to_all_physical_map[self.kt_config.layer_idx, :, 0].to(device)
++            if not torch.equal(m.cpu(), torch.arange(m.numel(), dtype=m.dtype)):
++                table = m.to(torch.int64)
++        self.__dict__["_log2phy_cache"] = table
++        return table
++
+     def __getattr__(self, name: str):
+         """Delegate attribute access to the wrapped GPU method.
+ 

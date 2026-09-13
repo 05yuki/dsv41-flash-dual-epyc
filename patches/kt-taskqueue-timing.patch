@@ -1,0 +1,109 @@
+diff --git a/kt-kernel/cpu_backend/task_queue.cpp b/kt-kernel/cpu_backend/task_queue.cpp
+index b38f360..e41fb64 100644
+--- a/kt-kernel/cpu_backend/task_queue.cpp
++++ b/kt-kernel/cpu_backend/task_queue.cpp
+@@ -15,8 +15,11 @@
+ #include <chrono>
+ #include <iostream>
+ #include <thread>
++#include <cstdlib>
++#include <cstdio>
+ 
+ TaskQueue::TaskQueue() : done(false), pending(0) {
++  if (const char* e = getenv("KT_TASKQUEUE_TIMING")) timing_every = atoi(e);
+   Node* dummy = new Node();
+   head.store(dummy, std::memory_order_relaxed);
+   tail.store(dummy, std::memory_order_relaxed);
+@@ -42,6 +45,7 @@ TaskQueue::~TaskQueue() {
+ void TaskQueue::enqueue(std::function<void()> task) {
+   pending.fetch_add(1, std::memory_order_acq_rel);
+   Node* node = new Node(task);
++  if (timing_every) node->t_enq = now_ns();
+   Node* prev = tail.exchange(node, std::memory_order_acq_rel);
+   prev->next.store(node, std::memory_order_release);
+   {
+@@ -52,6 +56,9 @@ void TaskQueue::enqueue(std::function<void()> task) {
+ 
+ void TaskQueue::sync(size_t allow_n_pending) {
+   std::exception_ptr task_exception;
++  const uint64_t t0 = timing_every ? now_ns() : 0;
++  if (timing_every && pending.load(std::memory_order_acquire) <= allow_n_pending)
++    sync_zero.fetch_add(1, std::memory_order_relaxed);
+   {
+     std::unique_lock<std::mutex> lock(mtx);
+     cv.wait(lock, [&] {
+@@ -61,6 +68,20 @@ void TaskQueue::sync(size_t allow_n_pending) {
+     task_exception = first_exception;
+     first_exception = nullptr;
+   }
++  if (timing_every) {
++    sync_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
++    const uint64_t n = n_syncs.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (n % uint64_t(timing_every) == 0) {
++      const uint64_t nt = n_tasks.exchange(0), qn = q_ns.exchange(0), rn = run_ns.exchange(0);
++      const uint64_t sn = sync_ns.exchange(0), sz = sync_zero.exchange(0);
++      fprintf(stderr,
++              "[kt-timing] %d syncs: tasks=%llu queue_wait=%.0f us/task run=%.0f us/task "
++              "(run total %.1f ms) | sync_wait=%.0f us/sync (total %.1f ms), %llu syncs found nothing pending\n",
++              timing_every, (unsigned long long)nt, nt ? qn / 1e3 / nt : 0.0, nt ? rn / 1e3 / nt : 0.0,
++              rn / 1e6, sn / 1e3 / timing_every, sn / 1e6, (unsigned long long)sz);
++      fflush(stderr);
++    }
++  }
+   if (task_exception) std::rethrow_exception(task_exception);
+ }
+ 
+@@ -71,11 +92,18 @@ void TaskQueue::worker() {
+     if (next) {
+       std::exception_ptr task_exception;
+       if (next->task) {
++        const uint64_t ts = timing_every ? now_ns() : 0;
+         try {
+           next->task();
+         } catch (...) {
+           task_exception = std::current_exception();
+         }
++        if (timing_every) {
++          const uint64_t te = now_ns();
++          n_tasks.fetch_add(1, std::memory_order_relaxed);
++          q_ns.fetch_add(ts - next->t_enq, std::memory_order_relaxed);
++          run_ns.fetch_add(te - ts, std::memory_order_relaxed);
++        }
+       }
+       delete curr;
+       curr = next;
+diff --git a/kt-kernel/cpu_backend/task_queue.h b/kt-kernel/cpu_backend/task_queue.h
+index cbcd2e6..6fc1a5b 100644
+--- a/kt-kernel/cpu_backend/task_queue.h
++++ b/kt-kernel/cpu_backend/task_queue.h
+@@ -11,6 +11,8 @@
+ #define CPUINFER_TASKQUEUE_H
+ 
+ #include <atomic>
++#include <chrono>
++#include <cstdint>
+ #include <condition_variable>
+ #include <exception>
+ #include <functional>
+@@ -32,10 +34,21 @@ class TaskQueue {
+   struct Node {
+     std::function<void()> task;
+     std::atomic<Node*> next;
++    uint64_t t_enq = 0;
+     Node() : task(nullptr), next(nullptr) {}
+     Node(const std::function<void()>& t) : task(t), next(nullptr) {}
+   };
+ 
++  // KT_TASKQUEUE_TIMING=<syncs>: every that many sync() calls, print how long
++  // tasks waited in the queue, how long they ran, and how long sync() blocked,
++  // to stderr. One sync per MoE layer in decode, so 400 = ten tokens.
++  int timing_every = 0;
++  std::atomic<uint64_t> n_tasks{0}, q_ns{0}, run_ns{0}, n_syncs{0}, sync_ns{0}, sync_zero{0};
++  static uint64_t now_ns() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
++
+   std::atomic<Node*> head;
+   std::atomic<Node*> tail;
+   std::atomic<bool> done;
