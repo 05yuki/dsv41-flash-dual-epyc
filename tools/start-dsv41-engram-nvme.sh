@@ -73,7 +73,14 @@ fi
 # reconstructed by replaying the last n_win tokens) and halves prefill here.
 # Gate 09-13 (t=1.0/p=0.95, 12 samples a side): replay off had 2 comma-shredded
 # and 1 looping sample, replay on had none. Default on; =0 turns it off.
-if [[ "${SGLANG_SWA_BOUNDED_REPLAY:-1}" == "1" ]]; then
+# 09-14: back to off by default. With replay on, the third request of a
+# session (100/51/100-paragraph prompts, 96-token completions) comes back as
+# garbage on the plain CPU path too; with it off the same three answer
+# correctly and the first and third are byte-identical. The 09-13 gate
+# measured one request per launch and never saw it. Prefill is ~2x slower
+# with it off (every layer sees the whole chunk); the streamed prefill
+# covers all 40 layers then.
+if [[ "${SGLANG_SWA_BOUNDED_REPLAY:-0}" == "1" ]]; then
   # Opt-in, prefill-only speedup; not numerically equivalent to full prefill.
   extra_args+=(--enable-decoder-swa-bounded-replay)
 fi
@@ -129,7 +136,10 @@ fi
 [[ -f "$adapter_dir/librow_store.so" ]] || { echo "build $adapter_dir/librow_store.so first (g++ -O2 -std=c++17 -shared -fPIC)" >&2; exit 4; }
 [[ -f "$source_dir/sglang/srt/layers/engram.py" ]] || { echo "dsv4.1 worktree missing: $source_dir" >&2; exit 4; }
 
-if pgrep -af 'llama-server|sglang.*(serve|launch_server)' | grep -F "$root" >/dev/null; then
+# Match the server processes themselves, not any shell whose command line
+# mentions a log path like logs/sglang-.../server.log (09-13: a waiting
+# `grep` on that path tripped this and the launch was refused).
+if pgrep -af 'llama-server|-m sglang[. ](serve|launch_server)' | grep -F "$root" >/dev/null; then
   echo "A native local-LLM server is already running; port $port is exclusive." >&2
   exit 6
 fi

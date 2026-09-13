@@ -14,11 +14,18 @@ it from *works* to *usable*. Nothing here is a fork; every change is a small
 patch against the two upstream trees, and the measurements say what each one
 bought.
 
-| | before (09-11) | after (09-13) |
-|---|---|---|
-| decode, single stream | 11-12 tok/s | **24 tok/s** |
-| prefill (2048-token chunks) | 25 tok/s | **74 tok/s** |
-| prefill after ~5 min of continuous load | 2× slower, indefinitely | flat |
+| | before (09-11) | after (09-13) | streamed prefill (09-14) |
+|---|---|---|---|
+| decode, single stream | 11-12 tok/s | **24 tok/s** | 24 tok/s |
+| 3564-token prompt + 96 decoded tokens, wall | — | 45 s | **17.3 s** |
+| 6945-token prompt + 96 decoded tokens, wall | — | 85-92 s | **36.5 s** |
+| prefill after ~5 min of continuous load | 2× slower, indefinitely | flat | flat (the CPU is idle during prefill) |
+
+(Measured with SWA Bounded Replay off, which is the launcher's default again:
+with it on, the third request of a session comes back as garbage on the CPU
+path too — an issue in the dsv4.1 tree's replay, not in anything here. With
+replay on and only the 21 non-SWA layers streaming, the 3564-token prompt
+took 12.8 s, but a session cannot rely on it.)
 | numerics | — | greedy output byte-identical across the kernel changes; the hot-expert map is the one change that moves logits (mean logprob unchanged, per-token median |Δ| 0.06 nats) |
 
 ## Hardware
@@ -70,6 +77,27 @@ bought.
    same structure; the follow-up is
    [#2205](https://github.com/kvcache-ai/ktransformers/pull/2205).
 
+6. **Prefill was the CPU expert GEMM, so prefill now streams the experts
+   to the GPU instead.** Above a token threshold the CPU-resident experts
+   are not computed on the CPU at all: kt-kernel keeps each TP part's expert
+   weights and scales in memfd arenas, each GPU rank maps the part it needs,
+   registers it as pinned (2 MB shmem pages: 0.2 s per layer; 4 KB pages
+   took 3-38 s through the IOMMU) and DMAs eight experts at a time straight
+   from the resident copy into a device slot; the CUTLASS repack, the e8m0
+   scale conversion and the MoE GEMM run as one CUDA graph per group. Only
+   layers 0..20 stream — under the model's SWA design layers 21..39 see 128
+   tokens per chunk and stay on the CPU (with replay off, the default, all
+   40 stream). 182 ms per streamed layer, 85% of the PCIe 4.0 x16 link; the
+   3564-token prompt goes from 45 s to 17.3 s wall including 96 decoded
+   tokens, the 6945-token one from ~90 s to 36.5 s. Two
+   things that ate a day on the way: every CUDA launch costs ~250 µs of host
+   time while the link is saturated by our own DMA (hence the graphs), and
+   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments` plus FlashInfer's in-capture
+   workspace allocation corrupts every prompt past the SWA window (the runner
+   patch carries the one arrangement that survives).
+   `patches/kt-stream-prefill.patch`, `kt-mxfp4-arena-and-upfirst-combined.patch`,
+   `tools/measure-dsv41-stream-prefill.sh`, `docs/DSV41-GPU-STREAMED-PREFILL-20260913.md`.
+
 Also in `docs/DSV41-DECODE-PROFILE-20260913.md`: the per-token budget after
 all of it (CPU experts 15 ms at 82% of the socket bandwidth, GPU 18 ms,
 engram 2, scheduler 3), and the profiler gotcha — SGLang's `/start_profile`
@@ -85,6 +113,12 @@ no kernels.
     routing histogram (`KT_ROUTING_DUMP`), logical→physical remap,
     zero-weight masking for the Marlin backend (`KT_GPU_MASK_ZERO`)
   - `kt-mxfp4-aperm-once.patch` — permuted activations once per expert
+  - `kt-stream-prefill.patch` — `kt_stream_prefill.py` (the streamed prefill),
+    the runner's shared CUTLASS workspace, the E-sizing fix; needs
+    `kt-ep-wrapper.patch` (the hook, `KT_GPU_STREAM_PREFILL=<tokens>`)
+  - `kt-mxfp4-arena-and-upfirst-combined.patch` — kt-kernel: `KT_EXPERT_SHM=1`
+    memfd expert arenas + `expert_arena_infos()`, and `KT_WRITE_UP_FIRST=1`
+    for the writer path (`kt-mxfp4-writer-upfirst.patch` is that part alone)
   - `mxfp4-avx2-gemv.patch` — the m==1 GEMV fast path (08-23; upstream #2175)
   - `kt-taskqueue-timing.patch`, `kt-prefill-stage-timing.patch` — clocks
     (`KT_TASKQUEUE_TIMING=<syncs>`, `KT_PREFILL_STAGE_TIMING=1`)
@@ -94,6 +128,12 @@ no kernels.
   NVMe with a bounded RAM cache and an I/O pool (derived from 0xSero's
   adapter)
 - `tools/build-kt-dsv41.sh` — rebuild `kt_kernel_ext` with the patches
+- `tools/measure-dsv41-stream-prefill.sh` — streamed-prefill A/B; the prompt
+  ends in three knowledge questions because a model whose streamed experts
+  arrived as zeros still copies the paragraph back as a "summary"
+- `tools/memguard-dsv41.sh` / `restart-memguard.sh` — logs host memory per
+  NUMA node every 5 s and kills the server at 6 GB of swap (the arenas fill
+  both nodes to ~15 GB free at the end of load)
 - `tools/measure-dsv41-prefill-order.sh`, `torch-profile-dsv41-*.sh`,
   `record-dsv41-routing.sh`, `build-dsv41-expert-placement.py`,
   `verify-dsv41-swa-long.sh` — the harnesses behind the numbers
@@ -116,12 +156,22 @@ no kernels.
    `DSV41_ENGRAM_BASE`.
 4. `KT_GPU0_UUID=... KT_GPU1_UUID=... tools/start-dsv41-engram-nvme.sh`.
 5. Keep air moving over socket 1's DIMMs. Really.
+6. For the streamed prefill (`ZEROCOPY=1` in the harness, i.e.
+   `KT_EXPERT_SHM=1 KT_GPU_STREAM_ZEROCOPY=1 KT_GPU_STREAM_PREFILL=1024
+   KT_GPU_STREAM_GROUP=8`), as root and not persistent across reboots:
+   `echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`,
+   `echo defer > /sys/kernel/mm/transparent_hugepage/defrag`,
+   `sysctl vm.swappiness=1`. Without the first the pinning of 4 KB shmem
+   pages takes minutes per request; without the other two the loader
+   swaps the desktop out.
 
 ## Not done
 
-- Prefill is still the CPU expert GEMM (97% of a prefill step); the
-  order-of-magnitude path is streaming expert weights to the GPU per expert
-  for prefill, which the 16 GB cards can hold one expert at a time.
+- The streamed prefill's fixed cost is per chunk (40 layers × 182 ms), so a
+  4096-token chunk would halve it per token; the 1M-token KV pool leaves
+  too little VRAM for it on 16 GB cards (512K context or a smaller
+  resident-expert workspace). The first request after launch pays ~5 s of
+  registration and graph capture that belongs at startup.
 - Speculative decoding (DSpark) pays badly while the CPU expert path costs
   per row; the m=2..8 tiling is the next kernel job.
 - The ~1 in 12 samples with a stray Latin fragment before "。" is the model's

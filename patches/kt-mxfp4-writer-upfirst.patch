@@ -1,0 +1,87 @@
+--- a/operators/avx2/mxfp4-moe.hpp	2026-09-13 16:02:59.492514698 +0900
++++ b/operators/avx2/mxfp4-moe.hpp	2026-09-13 15:14:09.413244444 +0900
+@@ -17,6 +17,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <string>
+ #include <utility>
+@@ -106,9 +107,9 @@
+   struct BufferA {
+     ggml_bf16_t* data = nullptr;
+     // Pre-permuted FP32 copy of the same rows (null when k % 32 != 0). Filled
+-    // once per expert by from_mat. Previously every gemm_mxfp4 call — one per
+-    // 64-row weight slice, 36-80 per expert in prefill — redid this conversion
+-    // for the whole m x k block, which was ~40% of such a task.
++    // once per expert by from_mat; before 09-13 every gemm_mxfp4 call — one
++    // per 64-row weight slice, 36-80 per expert — redid this conversion for
++    // the whole m x k block, which was ~40% of a prefill task.
+     float* perm = nullptr;
+     size_t max_m = 0, k = 0;
+ 
+@@ -827,6 +828,13 @@
+     size_t gpu_tp_weight_bytes = (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / 2;
+     size_t gpu_tp_scale_elem_count =
+         (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / group_size;
++    // KT_WRITE_UP_FIRST=1: w13 as [up; gate] instead of [gate; up], weights
++    // and scales alike, for consumers that store up first (FlashInfer CUTLASS
++    // MXFP4): one contiguous copy per expert instead of two.
++    static const bool up_first = getenv("KT_WRITE_UP_FIRST") != nullptr && getenv("KT_WRITE_UP_FIRST")[0] == '1';
++    const size_t gate_w_half = up_first ? gpu_tp_weight_bytes : 0, up_w_half = up_first ? 0 : gpu_tp_weight_bytes;
++    const size_t gate_s_half = up_first ? gpu_tp_scale_elem_count : 0,
++                 up_s_half = up_first ? 0 : gpu_tp_scale_elem_count;
+ 
+     if (cpu_tp_count >= gpu_tp_count) {
+       int target_gpu_tp = tp_part_idx / (cpu_tp_count / gpu_tp_count);
+@@ -846,10 +854,10 @@
+           [=, this](int tid) {
+             if (tid < NWT) {
+               size_t s = (size_t)tid * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
+-              if (s < e) std::memcpy(w13_wdst + w_off + s, gate_bb_[expert_id]->b + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + w_off + gate_w_half + s, gate_bb_[expert_id]->b + s, e - s);
+             } else if (tid < NWT * 2) {
+               size_t s = (size_t)(tid - NWT) * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
+-              if (s < e) std::memcpy(w13_wdst + w_off + gpu_tp_weight_bytes + s, up_bb_[expert_id]->b + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + w_off + up_w_half + s, up_bb_[expert_id]->b + s, e - s);
+             } else if (tid < NWT * 2 + ndt) {
+               size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
+               size_t cs = (size_t)(tid - NWT * 2) * cols_per;
+@@ -864,9 +872,9 @@
+                 fp32_to_bf16(w2_sdst + col * gss + gso, down_bb_[expert_id]->d + col * spc, spc);
+               }
+             } else if (tid == NWT * 2 + ndt) {
+-              fp32_to_bf16(w13_sdst + s_off, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
++              fp32_to_bf16(w13_sdst + s_off + gate_s_half, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+             } else {
+-              fp32_to_bf16(w13_sdst + s_off + gpu_tp_scale_elem_count, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
++              fp32_to_bf16(w13_sdst + s_off + up_s_half, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+             }
+           },
+           nullptr);
+@@ -893,10 +901,10 @@
+             size_t cow = (size_t)lg * dw, cos = (size_t)lg * ds;
+             if (tt < NWT) {
+               size_t s = (size_t)tt * wchunk, e = std::min(s + wchunk, dw);
+-              if (s < e) std::memcpy(w13_wdst + s, gate_bb_[expert_id]->b + cow + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + gate_w_half + s, gate_bb_[expert_id]->b + cow + s, e - s);
+             } else if (tt < NWT * 2) {
+               size_t s = (size_t)(tt - NWT) * wchunk, e = std::min(s + wchunk, dw);
+-              if (s < e) std::memcpy(w13_wdst + gpu_tp_weight_bytes + s, up_bb_[expert_id]->b + cow + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + up_w_half + s, up_bb_[expert_id]->b + cow + s, e - s);
+             } else if (tt < NWT * 2 + ndt) {
+               size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
+               size_t cs = (size_t)(tt - NWT * 2) * cols_per;
+@@ -910,9 +918,9 @@
+                 fp32_to_bf16(w2_sdst + col * sgc, down_bb_[expert_id]->d + csoff, sgc);
+               }
+             } else if (tt == NWT * 2 + ndt) {
+-              fp32_to_bf16(w13_sdst, gate_bb_[expert_id]->d + cos, ds);
++              fp32_to_bf16(w13_sdst + gate_s_half, gate_bb_[expert_id]->d + cos, ds);
+             } else {
+-              fp32_to_bf16(w13_sdst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cos, ds);
++              fp32_to_bf16(w13_sdst + up_s_half, up_bb_[expert_id]->d + cos, ds);
+             }
+           },
+           nullptr);

@@ -1,8 +1,8 @@
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 36c15cf1..78d557da 100644
+index 36c15cf1..fd2e6a1b 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-@@ -7,6 +7,7 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
+@@ -7,12 +7,14 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
  (using any quantization method) and CPU experts (using AMX/AVX instructions).
  """
  
@@ -10,13 +10,24 @@ index 36c15cf1..78d557da 100644
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Optional
  
-@@ -114,6 +115,38 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
+ import torch
+ 
+ from sglang.srt.arg_groups.overrides import model_config_of
++from sglang.srt.layers.moe.kt_stream_prefill import stream_prefill_for
+ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+ from sglang.srt.runtime_context import (
+     get_exec,
+@@ -114,6 +116,42 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
      return topk_ids
  
  
 +_routing_dump_prefix = os.environ.get("KT_ROUTING_DUMP")
 +_gpu_mask_zero = os.environ.get("KT_GPU_MASK_ZERO") == "1"
 +_routing_state = {}
++# layer_idx -> KTEPWrapperMethod on the rank that owns the kt-kernel wrapper
++# (rank 0); the streamed-prefill zero-copy path hands every layer's expert
++# arenas to the other ranks in one go.
++KT_LAYERS = {}
 +
 +
 +def _routing_count(device, layer_idx, topk_ids, rank):
@@ -49,7 +60,7 @@ index 36c15cf1..78d557da 100644
  class KTEPWrapperMethod(FusedMoEMethodBase):
      """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
  
-@@ -216,19 +249,32 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -216,19 +254,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # 2. Initialize KT wrapper for CPU experts
          # CPU experts: num_gpu_experts to num_experts-1
          if self.tp_rank == 0:
@@ -58,6 +69,7 @@ index 36c15cf1..78d557da 100644
 +            # GPU experts occupy ordinals 0..num_gpu_experts-1 (see above).
 +            gpu_mask = torch.zeros(num_experts, dtype=torch.bool)
 +            gpu_mask[: self.num_gpu_experts] = True
++            KT_LAYERS[self.kt_config.layer_idx] = self
              self.wrapper = KTMoEWrapper(
                  layer_idx=self.kt_config.layer_idx,
                  num_experts=num_experts,
@@ -83,7 +95,7 @@ index 36c15cf1..78d557da 100644
              )
  
      def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-@@ -297,6 +343,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -297,6 +349,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          topk_output = dispatch_output.topk_output
          topk_weights, topk_ids, _ = topk_output
  
@@ -98,7 +110,7 @@ index 36c15cf1..78d557da 100644
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
              x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-@@ -344,6 +398,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -344,9 +404,28 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output
@@ -113,10 +125,22 @@ index 36c15cf1..78d557da 100644
 +            remapped = torch.where(ids >= 0, log2phy[ids.clamp(min=0)], ids).to(ids.dtype)
 +            topk_output = topk_output._replace(topk_ids=remapped)
 +            dispatch_output = dispatch_output._replace(topk_output=topk_output)
++
++        # KT_GPU_STREAM_PREFILL=<tokens>: above that many tokens the CPU
++        # experts are streamed to the GPU in groups instead of computed here
++        # (kt_stream_prefill.py). The ids are taken before the mask below
++        # mutates them in place.
++        streamer = stream_prefill_for(self, layer, x.shape[0])
++        if streamer is not None:
++            physical_ids = topk_output.topk_ids.clone()
  
          # Step 1: Submit CPU expert computation (non-blocking)
-         if self.tp_rank == 0:
-@@ -355,7 +420,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+-        if self.tp_rank == 0:
++        if streamer is None and self.tp_rank == 0:
+             self.submit(layer, dispatch_output)
+ 
+         # Step 2: Prepare GPU computation by masking CPU expert IDs
+@@ -355,7 +434,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
  
          # Create modified dispatch output for GPU computation
@@ -139,7 +163,16 @@ index 36c15cf1..78d557da 100644
          masked_dispatch_output = dispatch_output._replace(
              topk_output=masked_topk_output
          )
-@@ -372,6 +451,21 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -366,12 +459,29 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+ 
+         # Step 4: Synchronize CPU results and merge with GPU results
+         output = gpu_combine_input.hidden_states
+-        if self.tp_rank == 0:
++        if streamer is not None:
++            output = output + streamer.run(self, layer, dispatch_output, physical_ids)
++        elif self.tp_rank == 0:
+             cpu_output = self.sync(x)
+             output = output + cpu_output
  
          return StandardCombineInput(hidden_states=output)
  

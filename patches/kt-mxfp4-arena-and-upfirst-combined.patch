@@ -1,0 +1,590 @@
+diff --git a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+index 1be1cf9..f7a7979 100644
+--- a/kt-kernel/ext_bindings.cpp
++++ b/kt-kernel/ext_bindings.cpp
+@@ -470,6 +470,10 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
+       .def("load_weights", &MoeClass::load_weights)
+       .def("forward", &MoeClass::forward_binding);
+ 
++  if constexpr (requires { &MoeClass::expert_arena_infos; }) {
++    moe_cls.def("expert_arena_infos", &MoeClass::expert_arena_infos);
++  }
++
+   // Bind write_weight_scale_to_buffer_task for MoE types that support it
+   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
+   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {
+diff --git a/kt-kernel/operators/avx2/moe_base.hpp b/kt-kernel/operators/avx2/moe_base.hpp
+index 3b1471f..f5e6362 100644
+--- a/kt-kernel/operators/avx2/moe_base.hpp
++++ b/kt-kernel/operators/avx2/moe_base.hpp
+@@ -23,6 +23,9 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <memory>
++#include <sys/mman.h>
++#include <tuple>
++#include <unistd.h>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -63,6 +66,43 @@ class AVX2_MOE_BASE {
+   std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
+ 
+   std::vector<void*> owned_aligned_allocs_;
++  // KT_EXPERT_SHM=1: expert weight blocks live in memfd-backed shared
++  // mappings, one per projection (gate, up, down), expert i at base + i *
++  // stride, so a GPU rank in another process can map the same pages and DMA
++  // straight from the resident copy (streamed prefill, 09-14).
++  struct ExpertArena {
++    int fd = -1;
++    uint8_t* base = nullptr;
++    size_t size = 0, stride = 0;
++  };
++  std::vector<ExpertArena> expert_arenas_;
++  static bool expert_shm_enabled() {
++    static const bool on = getenv("KT_EXPERT_SHM") != nullptr && getenv("KT_EXPERT_SHM")[0] == '1';
++    return on;
++  }
++  static ExpertArena make_expert_arena(size_t block, size_t count, const char* name) {
++    ExpertArena a;
++    a.stride = (block + 63) & ~63ULL;
++    a.size = a.stride * count;
++    a.fd = memfd_create(name, 0);
++    if (a.fd < 0) throw std::runtime_error("memfd_create failed for expert arena");
++    if (ftruncate(a.fd, (off_t)a.size) != 0) throw std::runtime_error("ftruncate failed for expert arena");
++    void* m = mmap(nullptr, a.size, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, 0);
++    if (m == MAP_FAILED) throw std::runtime_error("mmap failed for expert arena");
++    // 2 MB pages when /sys/kernel/mm/transparent_hugepage/shmem_enabled
++    // allows it (advise/always): cudaHostRegister of a 4 KB-paged 4.2 GB
++    // arena took 3-38 s per layer through the IOMMU (09-13); the DMA engine
++    // also prefers them.
++    madvise(m, a.size, MADV_HUGEPAGE);
++    a.base = (uint8_t*)m;
++    return a;
++  }
++  static void free_expert_arena(ExpertArena& a) {
++    if (a.base) munmap(a.base, a.size);
++    if (a.fd >= 0) close(a.fd);
++    a.base = nullptr;
++    a.fd = -1;
++  }
+ 
+   size_t pool_count_ = 0;
+   size_t gate_up_ba_pool_bytes_ = 0;
+@@ -112,6 +152,19 @@ class AVX2_MOE_BASE {
+     m_local_up_output_ptr_.resize(config_.expert_num);
+     m_local_down_output_ptr_.resize(config_.expert_num);
+ 
++    // KT_EXPERT_SHM=1: per-expert loaders keep the packed weights in the TP
++    // class's per-part buffers, so the base block only ever holds the fp32
++    // group scales; allocate scale-only arenas and scale-only BufferBs.
++    const bool use_expert_shm = expert_shm_enabled() && kHasScaleOnlyBufferB;
++    if (use_expert_shm) {
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_scale_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_gate_s"));
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_scale_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_up_s"));
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_scale_size(config_.hidden_size, config_.intermediate_size), config_.expert_num, "kt_down_s"));
++    }
++
+     for (size_t i = 0; i < config_.expert_num; i++) {
+       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
+       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
+@@ -119,23 +172,34 @@ class AVX2_MOE_BASE {
+       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
+       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
+ 
+-      void* gate_bb_ptr = std::aligned_alloc(
+-          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+-      if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
+-      owned_aligned_allocs_.push_back(gate_bb_ptr);
+-      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
+-
+-      void* up_bb_ptr = std::aligned_alloc(
+-          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+-      if (!up_bb_ptr) throw std::runtime_error("aligned_alloc failed for up BufferB");
+-      owned_aligned_allocs_.push_back(up_bb_ptr);
+-      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
+-
+-      void* down_bb_ptr = std::aligned_alloc(
+-          64, (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~63ULL);
+-      if (!down_bb_ptr) throw std::runtime_error("aligned_alloc failed for down BufferB");
+-      owned_aligned_allocs_.push_back(down_bb_ptr);
+-      down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
++      void *gate_bb_ptr, *up_bb_ptr, *down_bb_ptr;
++      if (use_expert_shm) {
++        gate_bb_ptr = expert_arenas_[0].base + i * expert_arenas_[0].stride;
++        up_bb_ptr = expert_arenas_[1].base + i * expert_arenas_[1].stride;
++        down_bb_ptr = expert_arenas_[2].base + i * expert_arenas_[2].stride;
++      } else {
++        gate_bb_ptr = std::aligned_alloc(
++            64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
++        if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
++        owned_aligned_allocs_.push_back(gate_bb_ptr);
++        up_bb_ptr = std::aligned_alloc(
++            64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
++        if (!up_bb_ptr) throw std::runtime_error("aligned_alloc failed for up BufferB");
++        owned_aligned_allocs_.push_back(up_bb_ptr);
++        down_bb_ptr = std::aligned_alloc(
++            64, (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~63ULL);
++        if (!down_bb_ptr) throw std::runtime_error("aligned_alloc failed for down BufferB");
++        owned_aligned_allocs_.push_back(down_bb_ptr);
++      }
++      if (use_expert_shm) {
++        gate_bb_.push_back(make_buffer_b_scale_only(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
++        up_bb_.push_back(make_buffer_b_scale_only(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
++        down_bb_.push_back(make_buffer_b_scale_only(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
++      } else {
++        gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
++        up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
++        down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
++      }
+     }
+ 
+     pool_count_ = config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
+@@ -158,6 +222,16 @@ class AVX2_MOE_BASE {
+   virtual ~AVX2_MOE_BASE() {
+     shared_mem_buffer_numa.dealloc(tp_part_idx, this);
+     for (void* p : owned_aligned_allocs_) std::free(p);
++    for (auto& a : expert_arenas_) free_expert_arena(a);
++  }
++
++  // (fd, size, stride) of the gate, up and down arenas; empty unless
++  // KT_EXPERT_SHM=1. Within a block: packed weights first, fp32 group scales
++  // at n * k / 2 (BufferB's layout).
++  std::vector<std::tuple<int, size_t, size_t>> expert_arena_info() const {
++    std::vector<std::tuple<int, size_t, size_t>> out;
++    for (auto& a : expert_arenas_) out.emplace_back(a.fd, a.size, a.stride);
++    return out;
+   }
+ 
+   void warm_up() {
+@@ -191,9 +265,21 @@ class AVX2_MOE_BASE {
+     derived_const()->write_weights_to_buffer(std::forward<Args>(args)...);
+   }
+ 
++  static bool stage_timing_enabled() {
++    static const bool on = getenv("KT_PREFILL_STAGE_TIMING") != nullptr;
++    return on;
++  }
++  static double stage_now_ms() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
++
+   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
+                        void* output) {
+     auto pool = config_.pool->get_subpool(tp_part_idx);
++    const bool st_on = stage_timing_enabled();
++    double st_t[8]; int st_i = 0;
++    auto st_mark = [&]() { if (st_on) st_t[st_i++] = stage_now_ms(); };
++    st_mark();
+ 
+     int activated_expert = 0;
+     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+@@ -270,6 +356,7 @@ class AVX2_MOE_BASE {
+       }
+     };
+ 
++    st_mark();  // 1: routing bookkeeping + buffer carve
+     // Copy input to per-expert buffers
+     direct_or_pool(qlen, [&](int i) {
+       for (int j = 0; j < k; j++) {
+@@ -279,12 +366,14 @@ class AVX2_MOE_BASE {
+       }
+     });
+ 
++    st_mark();  // 2: copy_input
+     // Pack input into BufferA (trivial memcpy for AVX2)
+     direct_or_pool(activated_expert, [this](int task_id) {
+       int expert_idx = m_expert_id_map_[task_id];
+       gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+     });
+ 
++    st_mark();  // 3: pack
+     if constexpr (has_fused_prefill()) {
+       if (activated_expert > 0) run_fused_prefill(activated_expert, qlen);
+     } else {
+@@ -306,8 +395,10 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+ 
++      st_mark();  // 4: gate/up gemm
+       // Activation: SiLU(gate) * up — AVX2 version (8 elements at a time)
+       apply_activation(activated_expert, nth, qlen);
++      st_mark();  // 5: activation
+ 
+       // Pack activation output into BufferA for down projection
+       pool->do_work_stealing_job(
+@@ -318,6 +409,7 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+ 
++      st_mark();  // 6: pack down
+       // Down GEMM
+       nth = T::recommended_nth(config_.hidden_size);
+       pool->do_work_stealing_job(
+@@ -331,6 +423,7 @@ class AVX2_MOE_BASE {
+           nullptr);
+     }
+ 
++    st_mark();  // 7: down gemm
+     // Weighted sum of expert outputs — AVX2 version (16 BF16 = 2x8 FP32 at a time)
+     pool->do_work_stealing_job(
+         qlen, nullptr,
+@@ -354,6 +447,14 @@ class AVX2_MOE_BASE {
+           }
+         },
+         nullptr);
++    if (st_on) {
++      st_t[st_i++] = stage_now_ms();
++      // rows per expert: total routed rows on this part / activated experts
++      size_t rows = 0; for (int i = 0; i < config_.expert_num; i++) rows += m_local_num_[i];
++      fprintf(stderr, "[kt-prefill-stage] tp%d layer%d qlen=%d experts=%d rows=%zu | bookkeep %.1f copy %.1f pack %.1f gateup %.1f act %.1f packdown %.1f down %.1f sum %.1f | total %.1f ms\n",
++              tp_part_idx, config_.layer_idx, qlen, activated_expert, rows,
++              st_t[1]-st_t[0], st_t[2]-st_t[1], st_t[3]-st_t[2], st_t[4]-st_t[3], st_t[5]-st_t[4], st_t[6]-st_t[5], st_t[7]-st_t[6], st_t[8]-st_t[7], st_t[8]-st_t[0]);
++    }
+   }
+ 
+   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+@@ -537,6 +638,27 @@ class AVX2_MOE_BASE {
+   std::shared_ptr<typename T::BufferB> make_buffer_b(size_t n, size_t k, void* data) const {
+     return derived_const()->make_buffer_b_impl(n, k, data);
+   }
++  // Backends whose BufferB can be scale-only (MXFP4, RawInt4) can keep the
++  // packed weights elsewhere; the KT_EXPERT_SHM arenas rely on that.
++  static constexpr bool kHasScaleOnlyBufferB =
++      requires(const Derived& d) {
++        T::BufferB::required_size_scale_only(size_t{}, size_t{}, int{});
++        d.make_buffer_b_scale_only_impl(size_t{}, size_t{}, (void*)nullptr);
++      };
++  std::shared_ptr<typename T::BufferB> make_buffer_b_scale_only(size_t n, size_t k, void* scales) const {
++    if constexpr (kHasScaleOnlyBufferB) {
++      return derived_const()->make_buffer_b_scale_only_impl(n, k, scales);
++    } else {
++      throw std::runtime_error("KT_EXPERT_SHM needs a backend with scale-only BufferB");
++    }
++  }
++  size_t buffer_b_scale_size(size_t n, size_t k) const {
++    if constexpr (kHasScaleOnlyBufferB) {
++      return T::BufferB::required_size_scale_only(n, k, config_.quant_config.group_size);
++    } else {
++      return 0;
++    }
++  }
+   std::shared_ptr<typename T::BufferC> make_buffer_c(size_t m, size_t n, void* data) const {
+     return derived_const()->make_buffer_c_impl(m, n, data);
+   }
+diff --git a/kt-kernel/operators/avx2/mxfp4-moe.hpp b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+index 6a9e111..f2c5f38 100644
+--- a/kt-kernel/operators/avx2/mxfp4-moe.hpp
++++ b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+@@ -17,6 +17,8 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <mutex>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <string>
+ #include <utility>
+@@ -97,22 +99,51 @@ struct GemmKernelAVX2MXFP4 {
+ 
+   // ---- Buffer types --------------------------------------------------------
+ 
++  // Decode emission order of the 256-bit PSHUFB group decode in gemm_mxfp4:
++  // activations are stored pre-permuted so the inner loops pair weights and
++  // activations with plain loads.
++  static constexpr int kGroupPerm[32] = {0,  2,  4,  6,  1,  3,  5,  7,  8,  10, 12, 14, 9,  11, 13, 15,
++                                         16, 18, 20, 22, 17, 19, 21, 23, 24, 26, 28, 30, 25, 27, 29, 31};
++
+   struct BufferA {
+     ggml_bf16_t* data = nullptr;
++    // Pre-permuted FP32 copy of the same rows (null when k % 32 != 0). Filled
++    // once per expert by from_mat; before 09-13 every gemm_mxfp4 call — one
++    // per 64-row weight slice, 36-80 per expert — redid this conversion for
++    // the whole m x k block, which was ~40% of a prefill task.
++    float* perm = nullptr;
+     size_t max_m = 0, k = 0;
+ 
+     BufferA() = default;
+-    BufferA(size_t m, size_t k_, int /*group_size*/, void* ptr) : data((ggml_bf16_t*)ptr), max_m(m), k(k_) {}
++    BufferA(size_t m, size_t k_, int /*group_size*/, void* ptr) : max_m(m), k(k_) { set_data(ptr); }
+ 
+-    static size_t required_size(size_t m, size_t k, int /*group_size*/) { return m * k * sizeof(ggml_bf16_t); }
+-    void set_data(void* ptr) { data = (ggml_bf16_t*)ptr; }
++    static size_t required_size(size_t m, size_t k, int /*group_size*/) {
++      return m * k * (sizeof(ggml_bf16_t) + sizeof(float));
++    }
++    void set_data(void* ptr) {
++      data = (ggml_bf16_t*)ptr;
++      perm = (k % 32 == 0) ? (float*)((uint8_t*)ptr + max_m * k * sizeof(ggml_bf16_t)) : nullptr;
++    }
+ 
+     void from_mat(int m, const ggml_bf16_t* src, int ith, int nth) {
+-      if (ith == 0 && nth == 1) {
+-        std::memcpy(data, src, (size_t)m * k * sizeof(ggml_bf16_t));
+-      } else {
+-        auto [m_start, m_end] = split_range(m, ith, nth);
+-        std::memcpy(data + m_start * k, src + m_start * k, (size_t)(m_end - m_start) * k * sizeof(ggml_bf16_t));
++      int m_start = 0, m_end = m;
++      if (!(ith == 0 && nth == 1)) {
++        auto r = split_range(m, ith, nth);
++        m_start = r.first;
++        m_end = r.second;
++      }
++      std::memcpy(data + (size_t)m_start * k, src + (size_t)m_start * k,
++                  (size_t)(m_end - m_start) * k * sizeof(ggml_bf16_t));
++      if (perm == nullptr) return;
++      const int groups = (int)(k / 32);
++      for (int mi = m_start; mi < m_end; mi++) {
++        const ggml_bf16_t* a_row = src + (size_t)mi * k;
++        float* p_row = perm + (size_t)mi * k;
++        for (int g = 0; g < groups; g++) {
++          const int base = g * 32;
++          float* dst = p_row + base;
++          for (int j = 0; j < 32; j++) dst[j] = GGML_BF16_TO_FP32(a_row[base + kGroupPerm[j]]);
++        }
+       }
+     }
+   };
+@@ -214,21 +245,24 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
+   // single-row loop.  Very large per-expert batches fall back to the generic
+   // path to bound the per-thread FP32 staging buffer.
+   // --------------------------------------------------------------------------
+-  if (group_size == 32 && (k % 32) == 0 && (size_t)m * (size_t)k <= (size_t)(4 << 20)) {
++  if (group_size == 32 && (k % 32) == 0 && (a.perm != nullptr || (size_t)m * (size_t)k <= (size_t)(4 << 20))) {
+     // Decode emission order within each 32-value group (see w0..w3 below).
+-    static constexpr int kPerm[32] = {0,  2,  4,  6,  1,  3,  5,  7,  8,  10, 12, 14, 9,  11, 13, 15,
+-                                      16, 18, 20, 22, 17, 19, 21, 23, 24, 26, 28, 30, 25, 27, 29, 31};
++    const int* kPerm = GemmKernelAVX2MXFP4::kGroupPerm;
+     static thread_local std::vector<float> a_perm_storage;
+-    if (a_perm_storage.size() < (size_t)m * k) a_perm_storage.resize((size_t)m * k);
+-    float* a_perm = a_perm_storage.data();
+-    for (int mi = 0; mi < m; mi++) {
+-      const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
+-      float* p_row = a_perm + (size_t)mi * k;
+-      for (int g = 0; g < group_count; g++) {
+-        const int base = g * 32;
+-        float* dst = p_row + base;
+-        for (int j = 0; j < 32; j++) dst[j] = GGML_BF16_TO_FP32(a_row[base + kPerm[j]]);
++    const float* a_perm = a.perm;
++    if (a_perm == nullptr) {
++      if (a_perm_storage.size() < (size_t)m * k) a_perm_storage.resize((size_t)m * k);
++      float* tmp = a_perm_storage.data();
++      for (int mi = 0; mi < m; mi++) {
++        const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
++        float* p_row = tmp + (size_t)mi * k;
++        for (int g = 0; g < group_count; g++) {
++          const int base = g * 32;
++          float* dst = p_row + base;
++          for (int j = 0; j < 32; j++) dst[j] = GGML_BF16_TO_FP32(a_row[base + kPerm[j]]);
++        }
+       }
++      a_perm = tmp;
+     }
+ 
+     const __m256i lut_lo256 = _mm256_broadcastsi128_si256(lut_lo);
+@@ -344,21 +378,24 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
+   // because kPerm never crosses the 16-value halves (indices 0-15 stay in the
+   // first half, 16-31 in the second).
+   // --------------------------------------------------------------------------
+-  if (group_size == 16 && (k % 32) == 0 && (size_t)m * (size_t)k <= (size_t)(4 << 20)) {
+-    static constexpr int kPerm[32] = {0,  2,  4,  6,  1,  3,  5,  7,  8,  10, 12, 14, 9,  11, 13, 15,
+-                                      16, 18, 20, 22, 17, 19, 21, 23, 24, 26, 28, 30, 25, 27, 29, 31};
++  if (group_size == 16 && (k % 32) == 0 && (a.perm != nullptr || (size_t)m * (size_t)k <= (size_t)(4 << 20))) {
++    const int* kPerm = GemmKernelAVX2MXFP4::kGroupPerm;
+     static thread_local std::vector<float> a_perm_storage;
+-    if (a_perm_storage.size() < (size_t)m * k) a_perm_storage.resize((size_t)m * k);
+-    float* a_perm = a_perm_storage.data();
+     const int block_count = k / 32;  // 32-value decode blocks; 2 groups each
+-    for (int mi = 0; mi < m; mi++) {
+-      const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
+-      float* p_row = a_perm + (size_t)mi * k;
+-      for (int blk = 0; blk < block_count; blk++) {
+-        const int base = blk * 32;
+-        float* dst = p_row + base;
+-        for (int j = 0; j < 32; j++) dst[j] = GGML_BF16_TO_FP32(a_row[base + kPerm[j]]);
++    const float* a_perm = a.perm;
++    if (a_perm == nullptr) {
++      if (a_perm_storage.size() < (size_t)m * k) a_perm_storage.resize((size_t)m * k);
++      float* tmp = a_perm_storage.data();
++      for (int mi = 0; mi < m; mi++) {
++        const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
++        float* p_row = tmp + (size_t)mi * k;
++        for (int blk = 0; blk < block_count; blk++) {
++          const int base = blk * 32;
++          float* dst = p_row + base;
++          for (int j = 0; j < 32; j++) dst[j] = GGML_BF16_TO_FP32(a_row[base + kPerm[j]]);
++        }
+       }
++      a_perm = tmp;
+     }
+ 
+     const __m256i lut_lo256 = _mm256_broadcastsi128_si256(lut_lo);
+@@ -644,6 +681,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+     // Always create full BufferB with owned weight buffer for both modes.
+     return std::make_shared<typename T::BufferB>((int)n, (int)k, config_.quant_config.group_size, data);
+   }
++  std::shared_ptr<typename T::BufferB> make_buffer_b_scale_only_impl(size_t n, size_t k, void* scales) const {
++    return std::make_shared<typename T::BufferB>((int)n, (int)k, config_.quant_config.group_size, scales, nullptr);
++  }
+   std::shared_ptr<typename T::BufferC> make_buffer_c_impl(size_t m, size_t n, void* data) const {
+     return std::make_shared<typename T::BufferC>(m, n, data);
+   }
+@@ -792,6 +832,13 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+     size_t gpu_tp_weight_bytes = (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / 2;
+     size_t gpu_tp_scale_elem_count =
+         (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / group_size;
++    // KT_WRITE_UP_FIRST=1: w13 as [up; gate] instead of [gate; up], weights
++    // and scales alike, for consumers that store up first (FlashInfer CUTLASS
++    // MXFP4): one contiguous copy per expert instead of two.
++    static const bool up_first = getenv("KT_WRITE_UP_FIRST") != nullptr && getenv("KT_WRITE_UP_FIRST")[0] == '1';
++    const size_t gate_w_half = up_first ? gpu_tp_weight_bytes : 0, up_w_half = up_first ? 0 : gpu_tp_weight_bytes;
++    const size_t gate_s_half = up_first ? gpu_tp_scale_elem_count : 0,
++                 up_s_half = up_first ? 0 : gpu_tp_scale_elem_count;
+ 
+     if (cpu_tp_count >= gpu_tp_count) {
+       int target_gpu_tp = tp_part_idx / (cpu_tp_count / gpu_tp_count);
+@@ -811,10 +858,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+           [=, this](int tid) {
+             if (tid < NWT) {
+               size_t s = (size_t)tid * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
+-              if (s < e) std::memcpy(w13_wdst + w_off + s, gate_bb_[expert_id]->b + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + w_off + gate_w_half + s, gate_bb_[expert_id]->b + s, e - s);
+             } else if (tid < NWT * 2) {
+               size_t s = (size_t)(tid - NWT) * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
+-              if (s < e) std::memcpy(w13_wdst + w_off + gpu_tp_weight_bytes + s, up_bb_[expert_id]->b + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + w_off + up_w_half + s, up_bb_[expert_id]->b + s, e - s);
+             } else if (tid < NWT * 2 + ndt) {
+               size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
+               size_t cs = (size_t)(tid - NWT * 2) * cols_per;
+@@ -829,9 +876,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+                 fp32_to_bf16(w2_sdst + col * gss + gso, down_bb_[expert_id]->d + col * spc, spc);
+               }
+             } else if (tid == NWT * 2 + ndt) {
+-              fp32_to_bf16(w13_sdst + s_off, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
++              fp32_to_bf16(w13_sdst + s_off + gate_s_half, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+             } else {
+-              fp32_to_bf16(w13_sdst + s_off + gpu_tp_scale_elem_count, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
++              fp32_to_bf16(w13_sdst + s_off + up_s_half, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+             }
+           },
+           nullptr);
+@@ -858,10 +905,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+             size_t cow = (size_t)lg * dw, cos = (size_t)lg * ds;
+             if (tt < NWT) {
+               size_t s = (size_t)tt * wchunk, e = std::min(s + wchunk, dw);
+-              if (s < e) std::memcpy(w13_wdst + s, gate_bb_[expert_id]->b + cow + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + gate_w_half + s, gate_bb_[expert_id]->b + cow + s, e - s);
+             } else if (tt < NWT * 2) {
+               size_t s = (size_t)(tt - NWT) * wchunk, e = std::min(s + wchunk, dw);
+-              if (s < e) std::memcpy(w13_wdst + gpu_tp_weight_bytes + s, up_bb_[expert_id]->b + cow + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + up_w_half + s, up_bb_[expert_id]->b + cow + s, e - s);
+             } else if (tt < NWT * 2 + ndt) {
+               size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
+               size_t cs = (size_t)(tt - NWT * 2) * cols_per;
+@@ -875,9 +922,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+                 fp32_to_bf16(w2_sdst + col * sgc, down_bb_[expert_id]->d + csoff, sgc);
+               }
+             } else if (tt == NWT * 2 + ndt) {
+-              fp32_to_bf16(w13_sdst, gate_bb_[expert_id]->d + cos, ds);
++              fp32_to_bf16(w13_sdst + gate_s_half, gate_bb_[expert_id]->d + cos, ds);
+             } else {
+-              fp32_to_bf16(w13_sdst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cos, ds);
++              fp32_to_bf16(w13_sdst + up_s_half, up_bb_[expert_id]->d + cos, ds);
+             }
+           },
+           nullptr);
+@@ -891,12 +938,19 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+   std::vector<void*> tp_owned_down_bufs_;
+   std::vector<void*> tp_owned_gate_bufs_;
+   std::vector<void*> tp_owned_up_bufs_;
++  using ExpertArena = typename AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::ExpertArena;
++  // KT_EXPERT_SHM=1: per part [gate_w, up_w, down_w] memfd arenas holding
++  // the packed weights (expert eid at base + eid * stride).
++  std::vector<std::vector<ExpertArena>> tp_weight_arenas_;
+ 
+  public:
+   using Base = TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>>;
+   using Base::Base;
+ 
+   ~TP_MOE() {
++    for (auto& part : tp_weight_arenas_)
++      for (auto& a : part) AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::free_expert_arena(a);
++    if (!tp_weight_arenas_.empty()) return;  // those pointers were arena bases
+     for (void* p : tp_owned_down_bufs_)
+       if (p) std::free(p);
+     for (void* p : tp_owned_gate_bufs_)
+@@ -905,6 +959,21 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+       if (p) std::free(p);
+   }
+ 
++  // Per TP part: [(fd, size, stride)] for gate_w, up_w, down_w, gate_s,
++  // up_s, down_s (KT_EXPERT_SHM=1; empty otherwise). Weights are packed
++  // e2m1 bytes, N x K/2 (gate/up) or K x N/2 (down) per expert; scales fp32.
++  std::vector<std::vector<std::tuple<int, size_t, size_t>>> expert_arena_infos() const {
++    std::vector<std::vector<std::tuple<int, size_t, size_t>>> out;
++    for (size_t i = 0; i < this->tps.size(); i++) {
++      std::vector<std::tuple<int, size_t, size_t>> v;
++      if (i < tp_weight_arenas_.size())
++        for (auto& a : tp_weight_arenas_[i]) v.emplace_back(a.fd, a.size, a.stride);
++      for (auto& t : this->tps[i]->expert_arena_info()) v.push_back(t);
++      out.push_back(v);
++    }
++    return out;
++  }
++
+   void load_weights() override {
+     auto& config = this->config;
+     auto& tps = this->tps;
+@@ -935,16 +1004,41 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+         // gate/up: [intermediate × hidden] = [N × K], TP slices along N → contiguous rows
+         size_t gate_up_wt_per_expert = (size_t)per_tp_interm * tpc.hidden_size / 2;
+         size_t gate_up_alloc = ((size_t)tpc.expert_num * gate_up_wt_per_expert + 63) & ~(size_t)63;
+-        uint8_t* gate_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
+-        uint8_t* up_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
+-        if (!gate_buf || !up_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 gate/up_buf");
+-        tp_owned_gate_bufs_[i] = gate_buf;
+-        tp_owned_up_bufs_[i] = up_buf;
+-        // down: [hidden × intermediate], TP slices along K → non-contiguous
+         size_t down_wt_per_expert = (size_t)tpc.hidden_size * per_tp_interm / 2;
+         size_t alloc_size = ((size_t)tpc.expert_num * down_wt_per_expert + 63) & ~(size_t)63;
+-        uint8_t* down_buf = (uint8_t*)std::aligned_alloc(64, alloc_size);
+-        if (!down_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 down_buf");
++        uint8_t *gate_buf, *up_buf, *down_buf;
++        if (AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::expert_shm_enabled()) {
++          // Weight bytes per expert are 64-aligned already for these shapes,
++          // so arena stride == gate_up_wt_per_expert and the per-expert
++          // pointer arithmetic below stays valid.
++          if (gate_up_wt_per_expert % 64 || down_wt_per_expert % 64)
++            throw std::runtime_error("KT_EXPERT_SHM: per-expert weight bytes must be 64-aligned");
++          std::vector<ExpertArena> arenas;
++          arenas.push_back(AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::make_expert_arena(
++              gate_up_wt_per_expert, tpc.expert_num, "kt_gate_w"));
++          arenas.push_back(AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::make_expert_arena(
++              gate_up_wt_per_expert, tpc.expert_num, "kt_up_w"));
++          arenas.push_back(AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::make_expert_arena(
++              down_wt_per_expert, tpc.expert_num, "kt_down_w"));
++          gate_buf = arenas[0].base;
++          up_buf = arenas[1].base;
++          down_buf = arenas[2].base;
++          {
++            static std::mutex m;
++            std::lock_guard<std::mutex> g(m);
++            if (tp_weight_arenas_.size() < this->tps.size()) tp_weight_arenas_.resize(this->tps.size());
++            tp_weight_arenas_[i] = std::move(arenas);
++          }
++        } else {
++          gate_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
++          up_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
++          if (!gate_buf || !up_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 gate/up_buf");
++          // down: [hidden × intermediate], TP slices along K → non-contiguous
++          down_buf = (uint8_t*)std::aligned_alloc(64, alloc_size);
++          if (!down_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 down_buf");
++        }
++        tp_owned_gate_bufs_[i] = gate_buf;
++        tp_owned_up_bufs_[i] = up_buf;
+         tp_owned_down_bufs_[i] = down_buf;
+ 
+         auto subpool = pool->get_subpool(i);
