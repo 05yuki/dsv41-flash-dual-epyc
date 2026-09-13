@@ -69,7 +69,11 @@ if [[ "$placement" != "none" ]]; then
     echo "expert placement $placement missing; running with logical 0..6 on the GPU" >&2
   fi
 fi
-if [[ "${SGLANG_SWA_BOUNDED_REPLAY:-0}" == "1" ]]; then
+# SWA Bounded Replay is part of the V4.1 design (model card: decoder SWA KV
+# reconstructed by replaying the last n_win tokens) and halves prefill here.
+# Gate 09-13 (t=1.0/p=0.95, 12 samples a side): replay off had 2 comma-shredded
+# and 1 looping sample, replay on had none. Default on; =0 turns it off.
+if [[ "${SGLANG_SWA_BOUNDED_REPLAY:-1}" == "1" ]]; then
   # Opt-in, prefill-only speedup; not numerically equivalent to full prefill.
   extra_args+=(--enable-decoder-swa-bounded-replay)
 fi
