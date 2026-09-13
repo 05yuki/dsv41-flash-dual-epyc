@@ -64,9 +64,11 @@ bought.
    every call — once per 64-row weight slice, 36-80 times per expert. Under
    the server's task size that was 40% of a prefill task. `BufferA` now
    carries the permuted copy, filled once per expert: prefill 2.1×, output
-   byte-identical. `patches/kt-mxfp4-aperm-once.patch`. (Upstream
-   kvcache-ai/ktransformers #2175 and #2176 carry the same structure; a
-   follow-up PR is pending.)
+   byte-identical. `patches/kt-mxfp4-aperm-once.patch`. The same rebuild
+   takes DeepSeek V4-Flash's prefill from 56.5 to 31.1 s per 2000 tokens on
+   this host. Upstream kvcache-ai/ktransformers #2175 and #2176 carry the
+   same structure; the follow-up is
+   [#2205](https://github.com/kvcache-ai/ktransformers/pull/2205).
 
 Also in `docs/DSV41-DECODE-PROFILE-20260913.md`: the per-token budget after
 all of it (CPU experts 15 ms at 82% of the socket bandwidth, GPU 18 ms,

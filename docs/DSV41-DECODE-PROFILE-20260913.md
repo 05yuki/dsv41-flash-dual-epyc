@@ -294,3 +294,7 @@ single-row path, stage barriers); maybe 1.5x more. The order-of-magnitude
 lever is still streaming expert weights to the GPU per expert for prefill
 (handover item 7).
 
+The same change rebuilt into the V4-Flash production venv (`venv-sglang-kt`,
+Huihui MXFP4, chunk 2048): 2000-token prefill 56.5 → 31.1 s (1.8×). Upstream
+follow-up: kvcache-ai/ktransformers #2205.
+
