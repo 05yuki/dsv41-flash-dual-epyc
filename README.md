@@ -1,6 +1,6 @@
 # DeepSeek V4.1-Flash on a dual EPYC 7452 + 2 × RTX 5070 Ti, 1M context
 
-Serving the ~0.8 T-parameter MoE (544 B in 384 routed experts, 197 B in the two engram tables, ~9 B active per token) from a used dual-socket EPYC Rome board and
+Serving DeepSeek's 552 B-backbone MoE (plus 196 B of Engram conditional memory; 8 B parameters active per token in prefill, 16 B in decode, per the model card) from a used dual-socket EPYC Rome board and
 two 16 GB gaming cards: 384 routed experts in MXFP4 on 512 GB of host DRAM
 through [KTransformers'](https://github.com/kvcache-ai/ktransformers)
 kt-kernel, attention and the seven hottest experts per layer on the GPUs
