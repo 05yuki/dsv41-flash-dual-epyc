@@ -102,10 +102,12 @@ threshold; 15 s is known not to be enough.
 
 ## What bounded replay actually does
 
-`--enable-decoder-swa-bounded-replay` is not a KV read path. In
-`models/deepseek_v4.py` it sets `late_layer_start = max(kv_source_layer_ids)+1`
-= 21 and runs layers 21-39 over each request's last `sliding_window` = 128
-extend tokens only. Nineteen of forty layers' worth of CPU expert work shrinks
+`--enable-decoder-swa-bounded-replay` is the model card's **SWA Bounded
+Replay** ("reconstructs missing SWA KV states by replaying only the most
+recent n_win tokens", part of the V4.1 design, not an approximation added
+here). In `models/deepseek_v4.py` it sets `late_layer_start =
+max(kv_source_layer_ids)+1` = 21 and runs layers 21-39 over each request's
+last `sliding_window` = 128 extend tokens only. Nineteen of forty layers' worth of CPU expert work shrinks
 from 701 (or 2048) rows to 128, which is why the 701-token request goes from
 30 s to 15-16 s and why the 09-11 note attributing the cost to "out-of-window
 KV reads" was wrong: the saving is in the MoE, on the CPU. It does not avoid
