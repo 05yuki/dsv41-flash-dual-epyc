@@ -16,7 +16,7 @@ bought.
 
 | | before (09-11) | after (09-13) | streamed prefill (09-14) |
 |---|---|---|---|
-| decode, single stream | 11-12 tok/s | **24 tok/s** | 24 tok/s |
+| decode, single stream | 11-12 tok/s | **24 tok/s** | 24 tok/s → **34 tok/s** with the 09-15 decode gate (finding 7) |
 | 3564-token prompt + 96 decoded tokens, wall | — | 45 s | **17.3 s** |
 | 6945-token prompt + 96 decoded tokens, wall | — | 85-92 s | **36.5 s** |
 | prefill after ~5 min of continuous load | 2× slower, indefinitely | flat | flat (the CPU is idle during prefill) |
@@ -77,6 +77,18 @@ took 12.8 s, but a session cannot rely on it.)
    same structure; the follow-up is
    [#2205](https://github.com/kvcache-ai/ktransformers/pull/2205).
 
+7. **Finding 5 cost decode a third, and nobody looked (09-15).** The
+   pre-permuted `BufferA` copy is written and read for every call, and for
+   the 1-8 rows of a decode step it lives in a cold region up to 40 MB from
+   the row data, while the gemm's own per-thread scratch was L1-hot. Found
+   by bisecting a 13% decode regression on Qwen3.8-Flash-Next (same kernel,
+   36.4 → 31.7 tok/s); here it was larger: with the copy gated to inputs of
+   16 rows or more (`BufferA.perm_m`, `kPermMinRows`), decode goes
+   **24 → 34 tok/s** (prose at t=1.0, hot-7 map, replay off), prefill keeps
+   the 2.1×. `patches/kt-mxfp4-aperm-decode-gate.patch` on top of
+   `kt-mxfp4-aperm-once.patch`; the combined kt-kernel patch carries it too.
+   #2205 upstream needs the same gate.
+
 6. **Prefill was the CPU expert GEMM, so prefill now streams the experts
    to the GPU instead.** Above a token threshold the CPU-resident experts
    are not computed on the CPU at all: kt-kernel keeps each TP part's expert
@@ -112,6 +124,7 @@ no kernels.
   - `kt-ep-wrapper.patch` — kt-kernel 0.7 mask shim, `KT_NUMA_NODES`,
     routing histogram (`KT_ROUTING_DUMP`), logical→physical remap,
     zero-weight masking for the Marlin backend (`KT_GPU_MASK_ZERO`)
+  - `kt-mxfp4-aperm-decode-gate.patch` — the 09-15 gate: the permuted copy only for prefill-sized inputs (decode 24 → 34)
   - `kt-mxfp4-aperm-once.patch` — permuted activations once per expert
   - `kt-stream-prefill.patch` — `kt_stream_prefill.py` (the streamed prefill),
     the runner's shared CUTLASS workspace, the E-sizing fix; needs
