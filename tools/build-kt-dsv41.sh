@@ -5,7 +5,7 @@
 # the previous .so beside it as .bak. Same toolchain and sysroot as the
 # next-pair builds.
 set -Eeuo pipefail
-root=$HOME/KTransformers
+root="${KTRANSFORMERS_ROOT:-$HOME/KTransformers}"
 venv="$root/venv-dsv41"
 src="$root/source/ktransformers-gemma4/kt-kernel"
 bld="$root/runtime/kt-dsv41-build"
@@ -22,5 +22,8 @@ cmake --build "$bld" --target kt_kernel_ext -j 16
 so=$(ls "$bld"/kt_kernel_ext.cpython-312-x86_64-linux-gnu.so)
 dst="$venv/lib/python3.12/site-packages/kt_kernel/kt_kernel_ext.cpython-312-x86_64-linux-gnu.so"
 [ -f "$dst.bak" ] || cp "$dst" "$dst.bak"
-cp "$so" "$dst"
+# Replace by rename, never in place: a running server has the old .so mapped,
+# and overwriting its pages under it can take the server down.
+cp "$so" "$dst.new"
+mv -f "$dst.new" "$dst"
 echo "installed $(ls -la "$dst")"

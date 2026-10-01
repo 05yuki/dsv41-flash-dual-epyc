@@ -9,10 +9,10 @@ set -Eeuo pipefail
 root="$HOME/KTransformers"
 out="${OUT:?set OUT}"
 order="${ORDER:-26 51 100}"
-stream="${STREAM:-2048}"
+stream="${STREAM:-512}"
 max_tokens="${MAX_TOKENS:-96}"
 exec >"$out" 2>&1
-echo "start $(date +%H:%M:%S) alloc=${ALLOC_CONF:-unset} frac=${FRAC:-0.85} zerocopy=${ZEROCOPY:-0} graph=${GRAPH:-1} upfirst=${UPFIRST:-1} stream=$stream group=${GROUP:-16} hostbufs=${HOSTBUFS:-3} chunk=${SGLANG_CHUNKED_PREFILL_SIZE:-2048} ctx=${SGLANG_CONTEXT_LENGTH:-default} order=$order max_tokens=$max_tokens"
+echo "start $(date +%H:%M:%S) alloc=${ALLOC_CONF:-unset} frac=${FRAC:-0.87} zerocopy=${ZEROCOPY:-0} graph=${GRAPH:-1} upfirst=${UPFIRST:-1} stream=$stream group=${GROUP:-4} hostbufs=${HOSTBUFS:-3} chunk=${SGLANG_CHUNKED_PREFILL_SIZE:-2048} ctx=${SGLANG_CONTEXT_LENGTH:-default} order=$order max_tokens=$max_tokens"
 # ATTACH=1: a server launched by hand (or by a harness that died) is already
 # loading or up; skip the stop/launch and just wait for it.
 if [ "${ATTACH:-0}" = "1" ]; then
@@ -45,12 +45,12 @@ fi
 # patched kt-kernel writer): GRAPH (per-group CUDA graphs, default on),
 # UPFIRST (writer emits [up; gate], one copy per group), GROUP (experts per
 # slot), HOSTBUFS, and the diagnostics NOMOE / SYNCDMA / PROFILE / DEBUG.
-export KT_GPU_STREAM_SELFTEST="${SELFTEST:-0}" KT_EXPERT_SHM="${ZEROCOPY:-0}" KT_GPU_STREAM_ZEROCOPY="${ZEROCOPY:-0}" KT_GPU_STREAM_GRAPH="${GRAPH:-1}" KT_GPU_STREAM_SYNC_DMA="${SYNCDMA:-0}" KT_WRITE_UP_FIRST="${UPFIRST:-1}" KT_GPU_STREAM_NOMOE="${NOMOE:-0}" KT_GPU_STREAM_PROFILE="${PROFILE:-0}" KT_GPU_STREAM_DEBUG="${DEBUG:-0}" KT_GPU_STREAM_PREFILL="$stream" KT_GPU_STREAM_GROUP="${GROUP:-16}" KT_GPU_STREAM_HOST_BUFS="${HOSTBUFS:-3}" KT_GPU_STREAM_TIMING="${TIMING:-1}"
+export KT_GPU_STREAM_SELFTEST="${SELFTEST:-0}" KT_EXPERT_SHM="${ZEROCOPY:-0}" KT_GPU_STREAM_ZEROCOPY="${ZEROCOPY:-0}" KT_GPU_STREAM_GRAPH="${GRAPH:-1}" KT_GPU_STREAM_SYNC_DMA="${SYNCDMA:-0}" KT_WRITE_UP_FIRST="${UPFIRST:-1}" KT_GPU_STREAM_NOMOE="${NOMOE:-0}" KT_GPU_STREAM_PROFILE="${PROFILE:-0}" KT_GPU_STREAM_DEBUG="${DEBUG:-0}" KT_GPU_STREAM_PREFILL="$stream" KT_GPU_STREAM_GROUP="${GROUP:-4}" KT_GPU_STREAM_HOST_BUFS="${HOSTBUFS:-3}" KT_GPU_STREAM_TIMING="${TIMING:-1}"
 # ALLOC_CONF=expandable_segments:True: the per-request token counts and the
 # 7- and 16-expert shapes fragment the ~2.8 GB left beside the 1M pool.
 [ -n "${ALLOC_CONF:-}" ] && export PYTORCH_CUDA_ALLOC_CONF="$ALLOC_CONF"
 old_pid="${own_pid:-}"
-SGLANG_MEM_FRACTION="${FRAC:-0.85}" "$root/tools/start-dsv41-engram-nvme.sh" --background >/dev/null
+SGLANG_MEM_FRACTION="${FRAC:-0.87}" "$root/tools/start-dsv41-engram-nvme.sh" --background >/dev/null
 L="$root/logs/sglang-dsv41-engram/current/server.log"
 # --background returns before the new run dir's pid file is written; the
 # stale pid of the previous server read here once made the loop below declare
@@ -82,7 +82,10 @@ PY
   B=$(wc -l <"$L")
   nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 -lms 1000 > /tmp/o-$2.txt 2>/dev/null &
   S=$!
-  t0=$(date +%s.%N); resp=$(curl -s -m 3600 http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d "$body"); t1=$(date +%s.%N)
+  # A 60K-token prompt is past the single-argument limit of execve; hand the
+  # body over as a file.
+  printf '%s' "$body" >/tmp/body-$2.json
+  t0=$(date +%s.%N); resp=$(curl -s -m 3600 http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d @/tmp/body-$2.json); t1=$(date +%s.%N)
   kill "$S" 2>/dev/null || true
   sleep 1
   python3 - "$resp" "$2" "$1" "$t0" "$t1" <<'PY'

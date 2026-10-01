@@ -28,14 +28,36 @@ max_total_tokens="${SGLANG_MAX_TOTAL_TOKENS:-1048576}"
 # Measured (logs/dsv41-decode-sweep.txt): 7 vs 12 GPU experts is a wash, since
 # 12 of 384 routed experts is 3% of activations; 64/96/112 CPU threads are all
 # the same and 128 collapses to 1.5 tok/s by starving the GPU-side threads.
-gpu_experts="${KT_GPU_EXPERTS:-7}"
+# 5 (was 7) since 09-16: hot-7 Marlin + streamer + 1M pool left 0.5 GB and OOMed
+# at 22K context; five hottest experts still catch 40% of routed slots (uniform 1.3%).
+# Stays at 5 (user decision 09-24: the 1M pool comes first). The placement is
+# rebuilt from V4.1's own routing under the writer load: the 09-13 map caught
+# 41.8% of routed slots, the new 5-slot map 47.9% (decode 27 -> 29.2 tok/s).
+# More slots eat the pool: 10 slots left it 559K tokens (31.3 tok/s), 8 slots
+# ~540K. Maps for 7/8/10 are in native-ubuntu/ for a decode-first run.
+gpu_experts="${KT_GPU_EXPERTS:-5}"
 cpu_threads="${KT_CPU_THREADS:-64}"
 # Deferring experts lets the GPU run ahead instead of blocking on the CPU
 # stage, and 0/2/4/6 measured 11.91/13.57/15.78/19.12 tok/s -- but 6, which is
 # num_experts_per_tok, DESTROYS the output: kana ratio 0.01, Chinese text,
 # wrong facts, then a repetition loop. That speed is bought by dropping expert
 # contributions. Do not raise this without reading the generated text.
-deferred_experts="${KT_DEFERRED_EXPERTS:-4}"
+# 0 (was 4) since 09-23. On V4-Flash-Vision 4 deferred made decode diverge from
+# prefill: teacher-forced the right continuation byte after the lead piece of
+# 掴/挿 sits at logprob ~0, yet generation at t=0.3 still emitted wrong ones,
+# 0.71-1.09 U+FFFD per 1k tokens against 0-0.11 with none deferred. Same kernel
+# path here, and the writer needs clean Japanese. Not re-measured on V4.1.
+deferred_experts="${KT_DEFERRED_EXPERTS:-0}"
+# kt hands MoE work over with stream memops and a spinning poller instead of
+# host functions (native-ubuntu/patches/kt-stream-memops.py). 09-24 arms:
+# held-out prose 25.4/26.1 -> 27.0/27.0 tok/s, paired NLL -0.0021 (SE 0.011,
+# n=3832). Two cores spin.
+export KT_STREAM_MEMOPS="${KT_STREAM_MEMOPS:-1}"
+export KT_TASKQUEUE_SPIN_US="${KT_TASKQUEUE_SPIN_US:-300}"
+# Decode all-reduces through host memory in NCCL's LL form
+# (patches/sglang-ll-allreduce.py; Vision-Exp gained 4-6%). Here 29.2 -> 29.4
+# tok/s only: the CPU experts dominate the token. Sums identical to NCCL's.
+export SGLANG_LL_ALLREDUCE="${SGLANG_LL_ALLREDUCE:-1}"
 # One expert pool per NUMA node by default. KT_THREADPOOL_COUNT=1 puts the
 # whole pool on node 0 (kt-kernel's sequential default); KT_NUMA_NODES=1 moves
 # it to node 1 (the worktree's kt_ep_wrapper reads it, patch of 09-12). Both
@@ -44,7 +66,16 @@ deferred_experts="${KT_DEFERRED_EXPERTS:-4}"
 # experts must then fit one 16 GB card: KT_GPU_EXPERTS=0 and a shorter
 # SGLANG_CONTEXT_LENGTH), for isolating whether socket 1's GPU rank is part of
 # the prefill-decay trigger.
-mem_fraction="${SGLANG_MEM_FRACTION:-0.85}"
+# 0.87 (was 0.85): the streamer now takes its device slots before the pool is
+# sized (KT_GPU_STREAM_EARLY_INIT), which at 0.85 truncated the pool to
+# 1,022,464 tokens; 0.87 keeps the full 1M.
+# 0.81 (was 0.87) since 09-24: a 48K prefill died in the indexer's candidate
+# selection at 0.85-0.87 whatever the slot count (its [2048, prefix] scores
+# grow with the prompt; patches/sglang-dsv4-candidate-blocks-nopad.py removed
+# a second copy of them). With 5 slots the pool has 1.1 GB to spare above 1M
+# tokens, so the fraction goes to the prefill instead: 0.80 kept 1,023,744
+# tokens and passed 51K in 284 s; 0.81 keeps the full 1M.
+mem_fraction="${SGLANG_MEM_FRACTION:-0.81}"
 kv_cache_dtype="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 # Prefill chunk. With 6-of-384 routing each expert sees chunk*6/384 rows per
 # chunk (32 at 2048), and the CPU expert stage streams every touched expert's
@@ -54,6 +85,18 @@ chunked_prefill="${SGLANG_CHUNKED_PREFILL_SIZE:-2048}"
 # SGLANG_EXTRA_ARGS passes arbitrary flags through, word-split on purpose, so a
 # one-off A/B needs no launcher edit (e.g. --enable-dynamic-chunking).
 extra_args=(${SGLANG_EXTRA_ARGS:-})
+# SWA pool headroom (09-16). With --disable-radix-cache the tree caps the SWA
+# pool at one request (5120 tokens) and the scheduler then cuts prefill into
+# 2048/768/1792 chunks; the streamed prefill costs ~7.5 s per chunk whatever
+# its size, so a 48K prompt took 37 chunks / 283 s. Six prefix tails raise
+# the cap to 7424 and every chunk is 2048: 24 chunks / 198 s. Costs ~1 GB of
+# VRAM per rank (SWA slots carry the c4 state), which hot-5 leaves free.
+extra_args+=(--swa-prefix-tails "${SGLANG_SWA_PREFIX_TAILS:-6}")
+# The radix cache stays off in production. DSV41_RADIX=1 keeps it, for the
+# depth ladder (tools/sglang-ladder.py), where each stage must reuse the
+# previous stage's context to time only the new chunk.
+radix_args=(--disable-radix-cache)
+[[ "${DSV41_RADIX:-0}" == "1" ]] && radix_args=()
 # Hot-expert placement (09-13): the seven GPU slots per layer hold the seven
 # experts the writer's routing hits most (45% of routed tokens) instead of
 # logical 0..6. Decode 18 -> 23.5 tok/s, no measurable degradation
@@ -61,13 +104,65 @@ extra_args=(${SGLANG_EXTRA_ARGS:-})
 # tools/build-dsv41-expert-placement.py from a KT_ROUTING_DUMP histogram and
 # needs the worktree's kt_ep_wrapper remap (patches/kt-ep-wrapper.patch).
 # KT_EXPERT_PLACEMENT=none turns it off; a path overrides the default file.
-placement="${KT_EXPERT_PLACEMENT:-$root/dsv41-expert-placement-7.json}"
+placement="${KT_EXPERT_PLACEMENT:-$root/dsv41-expert-placement-${gpu_experts}.json}"
 if [[ "$placement" != "none" ]]; then
   if [[ -f "$placement" ]]; then
     extra_args+=(--init-expert-location "$placement")
   else
     echo "expert placement $placement missing; running with logical 0..6 on the GPU" >&2
   fi
+fi
+# Kernel for the resident experts (09-16, found on V4-Flash): the tree's
+# default FlashInfer CUTLASS MXFP8 x MXFP4 kernel returns outlier tokens 6-12%
+# short; Marlin is W4A16 and matches the checkpoint within 0.5%. Needs the
+# wrapper's KT_GPU_MASK_ZERO (Marlin cannot take -1 ids). KT_HOT_BACKEND=cutlass
+# restores the 09-13 behaviour.
+hot_backend="${KT_HOT_BACKEND:-marlin}"
+if [[ "$gpu_experts" != "0" && "$hot_backend" == "marlin" ]]; then
+  extra_args+=(--moe-runner-backend marlin)
+  export KT_GPU_MASK_ZERO=1
+fi
+# W16 streaming reads the bf16 experts straight from kt-kernel's shared expert
+# arenas (KT_EXPERT_SHM=1, KT_GPU_STREAM_ZEROCOPY=1) under a captured CUDA graph
+# (KT_GPU_STREAM_GRAPH=1). kt_stream_prefill rejects W16 without the zero-copy
+# graph mode, so these three are W16 preconditions, not options -- the same set
+# tools/start-dsv4-flash-stream.sh exports. (09-18: they were only on the
+# V4-Flash launcher; V4.1 had W16 alone and the scheduler aborted at startup
+# with "KT_GPU_STREAM_W16 needs the zero-copy graph mode".)
+export KT_EXPERT_SHM="${KT_EXPERT_SHM:-1}"
+# Same tree as V4-Flash, which has had this on since 09-16: the
+# prefill-sized all-reduce goes through a host staging buffer instead
+# of NCCL's SHM transport, which measures 1.9 GB/s on these two cards.
+export SGLANG_HOST_STAGED_ALLREDUCE="${SGLANG_HOST_STAGED_ALLREDUCE:-1}"
+export KT_GPU_STREAM_ZEROCOPY="${KT_GPU_STREAM_ZEROCOPY:-1}"
+export KT_GPU_STREAM_GRAPH="${KT_GPU_STREAM_GRAPH:-1}"
+# Streamed prefill in bf16 (dequantized on the GPU) for the same reason; the
+# packed MXFP8 x MXFP4 path is KT_GPU_STREAM_W16=0.
+export KT_GPU_STREAM_W16="${KT_GPU_STREAM_W16:-1}"
+# Streamed prefill: a 2048-token chunk streams the 377 CPU experts of a layer
+# in ~185 ms (7.5 s per chunk, ~270 tok/s) whatever the chunk size, against
+# 74 tok/s on the CPU path, so it pays above ~550 tokens. G=8: the bf16 group
+# buffer is G x 35 MB and G=16 did not fit beside the seven Marlin experts.
+# The arenas are pinned at load time (EARLY_INIT): lazily, the 4K-page third
+# of them cost the first request 500 s on 09-16.
+export KT_GPU_STREAM_PREFILL="${KT_GPU_STREAM_PREFILL:-512}"
+export KT_GPU_STREAM_GROUP="${KT_GPU_STREAM_GROUP:-4}"
+export KT_GPU_STREAM_EARLY_INIT="${KT_GPU_STREAM_EARLY_INIT:-1}"
+# Each rank's pinning takes 70-1550 s with fragmented memory, and the ranks can
+# finish more than the stock 480 s apart: the post-load barrier then killed the
+# launch (09-22, 09-23). patches/sglang-load-barrier-timeout.py reads this.
+export SGLANG_UNBALANCED_LOAD_TIMEOUT_S="${SGLANG_UNBALANCED_LOAD_TIMEOUT_S:-1800}"
+# The arenas want 2 MB pages (kt-kernel madvises them): on 4K pages the pinning
+# above took 20-60 min and wandered, on 2 MB it is 0.2 s a layer. Two things
+# are needed: the host's shmem THP at advise (resets on reboot), and the
+# checkpoint's page cache dropped before each layer's experts load, or the
+# late layers find no free 2 MB block
+# (patches/sglang-kt-drop-cache-per-layer.py). 09-24: 328 of 337 GB huge,
+# startup 60+ min -> 11 min, NLL and decode unchanged.
+export KT_GPU_STREAM_DROP_CACHE="${KT_GPU_STREAM_DROP_CACHE:-$model}"
+if grep -q '\[never\]' /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>/dev/null; then
+  echo "WARNING: shmem THP is 'never'; the expert arenas will be 4K and pinning takes 20-60 min." >&2
+  echo "         echo advise | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled" >&2
 fi
 # SWA Bounded Replay is part of the V4.1 design (model card: decoder SWA KV
 # reconstructed by replaying the last n_win tokens) and halves prefill here.
@@ -120,8 +215,6 @@ compat_header="$root/tools/cuda13-glibc-compat.h"
 # the CPU expert path therefore crosses xGMI into socket 1's IOD.
 # KT_GPU_UUIDS overrides the list (e.g. the 21:00.0 UUID alone for a
 # single rank on the socket-0 card).
-# Set these to your two cards (nvidia-smi -L). The first is TP0, whose
-# scheduler runs on NUMA node 0.
 gpu0_uuid="${KT_GPU0_UUID:?set KT_GPU0_UUID}"
 gpu1_uuid="${KT_GPU1_UUID:?set KT_GPU1_UUID}"
 gpu_devices="${KT_GPU_UUIDS:-$gpu0_uuid,$gpu1_uuid}"
@@ -205,7 +298,7 @@ command=(
   --sampling-backend pytorch
   --watchdog-timeout 1200
   --disable-shared-experts-fusion
-  --disable-radix-cache
+  "${radix_args[@]}"
   --enable-metrics
   "${autotune_args[@]}"
   "${extra_args[@]}"
