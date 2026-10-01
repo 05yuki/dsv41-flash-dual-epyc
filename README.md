@@ -28,9 +28,10 @@ bought.
 | startup (476 GB loaded and pinned) | — | 60+ min | **11 min** |
 | context | 1M | 1M | 1M (the ladder ran at a 262K pool with radix on) |
 
-¹ The 09-15 run did not record the deferral setting, and the launcher then
-defaulted to four deferred experts, so it is not comparable with the
-every-expert numbers after 09-23.
+¹ With four of the six routed experts per token deferred (the launcher's
+default until 09-23), so it is not comparable with the every-expert numbers
+after that. Deferral changes the arithmetic, and on V4-Flash-Vision it broke
+UTF-8 in Japanese output, which is why it is off now.
 
 The depth ladder follows [llama-split-bench](https://github.com/jimoto-no-llm/bench-of-us)'s
 `measure_ladder.py` / `measure_pp0.py`, ported to SGLang's `/generate`
@@ -111,8 +112,8 @@ added after 09-11 and has not been traced yet.
 7. **Finding 5 cost decode, and nobody looked (09-15).** The pre-permuted copy
    is written and read on every call, and for the few rows of a decode step it
    lives in a cold region while the gemm's own scratch was L1-hot. Gated to
-   inputs of 16 rows or more: decode 24 → 34 tok/s at the time, prefill keeps
-   the 2.1×. `patches/kt-mxfp4-aperm-decode-gate.patch`. Upstream as
+   inputs of 16 rows or more: decode 24 → 34 tok/s with four experts
+   deferred, prefill keeps the 2.1×. `patches/kt-mxfp4-aperm-decode-gate.patch`. Upstream as
    [#2209](https://github.com/kvcache-ai/ktransformers/pull/2209) (merged 09-17).
 8. **The CUTLASS MXFP8 × MXFP4 kernel shortchanged outlier tokens (09-16).**
    On the hot GPU experts it returned 6-12% too small a result for tokens with
