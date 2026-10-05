@@ -241,6 +241,29 @@ if pgrep -af '^sglang::(scheduler|detokenizer)' >/dev/null; then
   exit 6
 fi
 
+# KT prefill lend (patches/kt_lend.py through sglang-dsv41-kt-prefill-lend.py,
+# on by default since 10-06, KT_PREFILL_LEND=0 turns it off): the decoder
+# weights (not the engram's) go to the prefill while it runs, so the chunk can
+# grow past what the KV pool leaves. The chunk comes from what the server
+# measured (tools/kt-lend-auto.sh): the first launch calibrated 16384 (out of
+# memory, the indexer's scores grow with chunk x prefix) and settled at 8192.
+# 10-06 against chunk 2048 without it: 8K 257 -> 602 tok/s, 38K 255 -> 636-639,
+# 114K 259 -> 594 (441 -> 192 s), decode 25.5 -> 27.4-27.9, paired NLL z -1.90
+# (at chunk 4096). The SWA pool needs nothing here (with prefix tails its cap
+# already counts the chunk), but it grows with the chunk: the full-attention
+# KV pool is 1,031,680 tokens at 8192 instead of 1M.
+KT_PREFILL_LEND="${KT_PREFILL_LEND:-1}"
+[[ -f "$source_dir/sglang/srt/layers/moe/kt_lend.py" ]] || KT_PREFILL_LEND=0  # tree without the patch
+export KT_PREFILL_LEND
+if [[ "$KT_PREFILL_LEND" == 1 ]]; then
+  # shellcheck source=kt-lend-auto.sh
+  source "$root/tools/kt-lend-auto.sh"
+  kt_lend_auto "$0" SGLANG_CHUNKED_PREFILL_SIZE "$port" "$model" "$context_length" "$max_total_tokens" \
+    "$mem_fraction" "$gpu_devices" "$gpu_experts" "$placement" "${SGLANG_SWA_PREFIX_TAILS:-6}" || exit $?
+  chunked_prefill="$KT_LEND_CHUNK"
+  echo "prefill lend: chunk $chunked_prefill" >&2
+fi
+
 timestamp="$(date +%Y%m%d-%H%M%S)"
 run_dir="$root/logs/$log_name/$timestamp"
 mkdir -p "$run_dir"
