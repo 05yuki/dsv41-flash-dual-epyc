@@ -167,32 +167,31 @@ added after 09-11 and has not been traced yet.
     `patches/kt-mxfp4-g32-kblock.py`, and the decode shuffle without
     `vinserti128`, `patches/kt-mxfp4-decode-noinsert.py`.
 
-16. **Lending the GPU weights to the prefill (10-06).** The streamed prefill
-    pays about 7.5-9 s a forward whatever the chunk, so a 4x chunk is close
+16. **Lending the GPU weights to the prefill (10-06).** A streamed-prefill
+    forward costs about 7.5-9 s whatever the chunk, so 4x the chunk is close
     to 4x fewer forwards, but at chunk 2048 the 1M pool, the hot experts and
-    the streamer's buffers left no room for a larger one. During a streamed
-    prefill the decoder weights now give their physical memory to it through
-    torch_memory_saver (addresses kept, so the decode CUDA graphs stay
-    valid), each layer's weights come back from a pinned host copy just
-    before it runs, and the streamer's prefill-only buffers live in a region
-    resident only then. The engram stays resident (its layer-14 rows are read
-    ahead on another stream). V4.1 calls its decoder layer through
-    `forward_hc_pre_from_prev`, which is wrapped like `forward`.
-    The launcher calibrates the chunk on a setup's first launch: 16384 ran
-    out of memory (the indexer's candidate scores grow with chunk × prefix),
-    8192 held. Paired per-token NLL against chunk 2048 without the lend,
-    2,477 tokens, two lend launches at chunk 4096: delta -0.0153 (z -1.42)
-    and -0.0213 (z -1.90); the prose pieces go through the lend, the short
-    text pieces do not. The SWA pool already counts the chunk with prefix
-    tails, and at 8192 it takes enough that the full-attention pool is
-    1,031,680 tokens instead of 1M; VRAM after a 114K prefill is
-    15,279 / 15,390 MiB. Back-to-back 38K prefills alternated
-    87 / 125 s at chunk 4096 with the inlet at 51.5 °C (finding 1 again).
-    `patches/sglang-dsv41-kt-prefill-lend.py` with `patches/kt_lend.py`, and
-    the kt-kernel side `patches/kt-kernel-shared-gpu-output.py`,
-    `patches/kt-kernel-lend-gpu-output.py`; the model-independent version and
-    the other models it runs on are in
+    the streamer's buffers left no room for more. Now, during a streamed
+    prefill, the decoder weights give up their VRAM (torch_memory_saver keeps
+    the addresses, so the decode CUDA graphs stay valid) and come back one
+    layer at a time from a pinned host copy; the streamer's buffers exist only
+    then. How it works and the other models it runs on:
     [kt-prefill-lend](https://github.com/05yuki/kt-prefill-lend).
+    - Chunk: the launcher calibrates it on a setup's first launch. 16384 ran
+      out of memory (the indexer's candidate scores grow with chunk × prefix),
+      8192 held. Speed is in the table above.
+    - Quality: paired per-token NLL against chunk 2048 without the lend, 2,477
+      tokens, two lend launches at chunk 4096 (not yet at 8192): delta -0.0153
+      (z -1.42) and -0.0213 (z -1.90). Only the prose pieces are long enough
+      to go through the lend.
+    - Cost: the SWA pool grows with the chunk, so the full-attention pool is
+      1,031,680 tokens instead of 1M. VRAM after a 114K prefill:
+      15,279 / 15,390 MiB.
+    - The engram stays resident. Back-to-back 38K prefills at chunk 4096
+      alternated 87 / 125 s with the inlet at 51.5 °C: finding 1, not the lend.
+    - Files: `patches/kt_lend.py`, `patches/sglang-dsv41-kt-prefill-lend.py`,
+      `patches/sglang-kt-stream-shared-graph-inputs.py`,
+      `patches/kt-kernel-shared-gpu-output.py`,
+      `patches/kt-kernel-lend-gpu-output.py`, `tools/kt-lend-auto.sh`.
 
 Also in `docs/DSV41-DECODE-PROFILE-20260913.md`: the per-token budget as of
 09-13, and the profiler gotcha — SGLang's `/start_profile` wants the activity
@@ -204,16 +203,9 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
   1aa0e962) and `kvcache-ai/ktransformers` kt-kernel:
   - `sglang-dsv41-tree-20260916.patch` — the whole SGLang tree as of 09-16
     (supersedes the SGLang parts of the older `.patch` files)
-  - the `.py` patchers apply on top of that, idempotently:
-    `sglang-host-staged-allreduce-race.py`, `sglang-ll-allreduce.py`,
-    `sglang-kt-drop-cache-per-layer.py`, `sglang-load-barrier-timeout.py`,
-    `sglang-dsv4-indexer-query-step.py`, `sglang-dsv4-candidate-blocks-nopad.py`,
-    `sglang-kt-stream-shared-graph-inputs.py`, then
-    `sglang-dsv41-kt-prefill-lend.py <tree>` (copies `kt_lend.py`, next to
-    it, into the tree); kt-kernel: `kt-stream-memops.py`,
-    `kt-mxfp4-decode-noinsert.py`, `kt-mxfp4-g32-loop-order.py`,
-    `kt-mxfp4-g32-kblock.py`, and on the installed `kt_kernel/experts_base.py`
-    `kt-kernel-shared-gpu-output.py` then `kt-kernel-lend-gpu-output.py`
+  - the `.py` patchers apply on top of that, idempotently (order under
+    Reproducing); `kt_lend.py` is copied into the tree by
+    `sglang-dsv41-kt-prefill-lend.py`
   - `fp8-skinny-splitk.patch`, `kt-ep-wrapper.patch`, `kt-stream-prefill.patch`,
     `kt-mxfp4-arena-and-upfirst-combined.patch` (`KT_EXPERT_SHM=1` memfd
     expert arenas, and `KT_WRITE_UP_FIRST=1`; `kt-mxfp4-writer-upfirst.patch`
@@ -247,24 +239,37 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
 ## Reproducing
 
 1. SGLang `dsv4.1` worktree at 1aa0e962 with
-   `patches/sglang-dsv41-tree-20260916.patch`, then the SGLang `.py` patchers.
-   kt-kernel with the kt patches and patchers, built by `tools/build-kt-dsv41.sh`.
-2. `vm.min_free_kbytes = 8388608` (a node-bound OOM from the CUDA JIT
+   `patches/sglang-dsv41-tree-20260916.patch`, then, in this order:
+   `sglang-host-staged-allreduce-race.py`,
+   `sglang-ll-allreduce.py`, `sglang-kt-drop-cache-per-layer.py`,
+   `sglang-load-barrier-timeout.py`, `sglang-dsv4-indexer-query-step.py`,
+   `sglang-dsv4-candidate-blocks-nopad.py`,
+   `sglang-kt-stream-shared-graph-inputs.py`, `sglang-dsv41-kt-prefill-lend.py`.
+   The patchers expect the tree at `~/KTransformers/source/sglang-dsv41`;
+   some take another path as their argument, the rest name it in their first
+   lines.
+2. kt-kernel with the kt `.patch` files above, then `kt-stream-memops.py`,
+   `kt-mxfp4-decode-noinsert.py`, `kt-mxfp4-g32-loop-order.py`,
+   `kt-mxfp4-g32-kblock.py` (expected at
+   `~/KTransformers/source/ktransformers-gemma4`), built by
+   `tools/build-kt-dsv41.sh`; then, on the installed `kt_kernel/experts_base.py`,
+   `kt-kernel-shared-gpu-output.py` and `kt-kernel-lend-gpu-output.py`.
+   `pip install torch_memory_saver` (0.0.9.post1) in the same venv.
+3. `vm.min_free_kbytes = 8388608` (a node-bound OOM from the CUDA JIT
    otherwise kills the scheduler while the experts sit in DRAM).
-3. Engram manifest per `docs/DSV41-ENGRAM-MXFP4.md`; `DSV41_ENGRAM_DIR`,
+4. Engram manifest per `docs/DSV41-ENGRAM-MXFP4.md`; `DSV41_ENGRAM_DIR`,
    `DSV41_ENGRAM_BASE`.
-4. As root, made persistent (e.g. through tmpfiles.d):
+5. As root, made persistent (e.g. through tmpfiles.d):
    `echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled`,
    `echo defer > /sys/kernel/mm/transparent_hugepage/defrag`, and swap off.
    Without the first, pinning 4 KB shmem pages takes most of an hour; the
    launcher warns when it is `never`.
-5. `KT_GPU0_UUID=... KT_GPU1_UUID=... tools/start-dsv41-engram-nvme.sh`. The
+6. `KT_GPU0_UUID=... KT_GPU1_UUID=... tools/start-dsv41-engram-nvme.sh`. The
    streamed prefill, the Marlin hot experts, memops, both all-reduce paths and
    the prefill lend are on by default. The first launch of a setup starts the
-   server once more for calibration (a ~60K-token prompt) and keeps the
-   chunk it measured in `~/.cache/kt-lend/`. Needs torch_memory_saver in the
-   venv.
-6. Keep air moving over socket 1. Really.
+   server once more for calibration (a 50-60K-token prompt) and keeps the
+   chunk it measured in `~/.cache/kt-lend/`.
+7. Keep air moving over socket 1. Really.
 
 ## Not done
 
