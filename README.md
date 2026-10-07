@@ -27,7 +27,7 @@ bought.
 | prefill, ~114K tokens | — | — | 114,166 tokens in 441 s (259 tok/s, 10-05) | 114,162 tokens in **191.6 s** (596 tok/s) |
 | prefill at depth 0 / 29k / 64k / 128k | — | — | 242 / 249 / 185 / 211 tok/s | — |
 | prefill chunk | 2048 | 2048 | 2048 | 6144, the widest that keeps the KV pool; calibrated with the lend probe up to 1M |
-| startup (476 GB loaded and pinned) | — | 60+ min | 11 min | **351 s** cold |
+| startup (476 GB loaded and pinned) | — | 60+ min | 11 min | **243 s** cold |
 | context | 1M | 1M | 1M (the ladder ran at a 262K pool with radix on) | 1M, KV pool 1,048,576 tokens; a 989,154-token prompt prefills in **2,433.9 s** (406 tok/s, the first prefill after a launch) |
 
 ¹ With four of the six routed experts per token deferred (the launcher's
@@ -267,11 +267,37 @@ added after 09-11 and has not been traced yet.
     - Cold page cache, expert layers / Load weight / launch to `/health`:
       this morning 612 / 696 / 740 s; prefetch on the NV7400 223 / 377 /
       434 s (the read still waited 205 s in total); prefetch on the SN5100
-      **129 / 286 / 351 s**, waits 24 s. Vision (147 GB) went 141 / 217 /
-      266 s to 52 / 124 / 170 s with 0.0 s of waiting. What is left in a
-      V4.1 launch: 129 s before the first expert layer (the dense shards and
-      the GPU experts), 129 s of expert layers at 3.3 s each (now the copy
-      itself), 28 s of arena pinning, 33 s of KV and graphs.
+      129 / 286 / 351 s, waits 24 s. Vision (147 GB) went 141 / 217 /
+      266 s to 52 / 124 / 170 s with 0.0 s of waiting.
+    - Then the phase before the first expert layer, 129 s, turned out to be
+      Python, not I/O: the shard walk hands the model ~100K routed-expert
+      tensors that live on the CPU, and each one goes through the name
+      remap, the 768-entry expert mapping scan and a weight_loader call
+      that returns at once (1.6 s a shard, steady, 74 s; nothing read from
+      disk for them). `sglang-dsv4-load-skip-cpu-experts.py` asks each KT
+      MoE layer which logical experts have no GPU slot (the loader's own
+      logical -> physical -> local mapping and its `num_gpu_experts` check)
+      and drops those tensors right after the remap: 74 -> 65 s. The rest
+      of that phase is the dense weights' own loading and the fp8 wo_a
+      dequant; `sglang-dense-prefetch.py` preads each shard's dense
+      tensors (not the routed experts, not the engram tables) as the shard
+      loader opens it, for a small gain.
+    - With the expert layers at 68 s, rank 1's `cudaHostRegister` of the
+      arenas stuck out: layers 0-36 in 0.2-0.4 s each on both ranks, but
+      rank 1's layers 37-39 took 12, 36 and 21 s (rank 0's 0.3 s; rank 0
+      wrote the pages, rank 1 maps the memfds fresh and must fault every
+      page in). Those last arenas were allocated with the next layer's
+      pages sitting in the page cache and came out on 4 KB pages; with the
+      prefetch off, every layer pinned under 0.9 s. Parallel
+      `MADV_POPULATE_READ` before the register made it worse (124 s a
+      layer). So the last `KT_LOAD_PREFETCH_TAIL` (4) layers are read after
+      their arena exists, with the whole-tree cache drop back on for them;
+      rank 1 then pins every layer under 1 s.
+    - Result, cold: expert layers 68 s, Load weight 197 s, ready in
+      **243 s** (740 s this morning). ShmemHugePages 327 of 351 GB. What is
+      left: ~95 s before the first expert layer (65 s of shard walk, the
+      dense load and the wo_a dequant), 68 s of expert layers (the copy
+      itself, 2 GiB/s into fresh 2 MB pages), 19 s of KV and graphs.
 
 Also in `docs/DSV41-DECODE-PROFILE-20260913.md`: the per-token budget as of
 09-13, and the profiler gotcha — SGLang's `/start_profile` wants the activity
@@ -283,7 +309,8 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
   1aa0e962) and `kvcache-ai/ktransformers` (commit 95009ea):
   - `sglang-dsv41-tree-20261007.patch` — the whole SGLang tree as running on
     10-07, prefill lend, probe, the indexer fixes of finding 17 and the
-    cache-drop change of finding 18 included
+    load changes of finding 18 (CPU-expert skip, dense prefetch, cache-drop
+    tail) included
     (supersedes `sglang-dsv41-tree-20260916.patch`, the SGLang `.py` patchers
     and the SGLang parts of the older `.patch` files; it also carries the
     V4-Flash-Vision path and a few switches that are off by default)
@@ -342,8 +369,9 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
    `sglang-dsv4-swa-pool-floor.py`, `sglang-dsv4-candidate-mask-inplace.py`,
    `sglang-dsv4-candidate-mask-blocks.py`, `sglang-dsv4-indexer-slice-budget.py`,
    `sglang-kt-stream-graph-keep.py`, `sglang-kt-lend-probe.py`,
-   `sglang-kt-drop-cache-skip-prefetch.py`, each with the tree as its
-   argument. That gives the same files V4.1 runs; the 10-07
+   `sglang-kt-drop-cache-skip-prefetch.py`,
+   `sglang-dsv4-load-skip-cpu-experts.py`, `sglang-dense-prefetch.py`, each
+   with the tree as its argument. That gives the same files V4.1 runs; the 10-07
    patch adds the Vision path.
 2. kvcache-ai/ktransformers at 95009ea with
    `patches/kt-kernel-tree-20261006.patch` (`git apply`; the submodules

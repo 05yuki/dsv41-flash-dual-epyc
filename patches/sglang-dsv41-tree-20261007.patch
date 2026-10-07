@@ -845,7 +845,7 @@ index 7dba72ae..aec621a3 100644
 +        return keep  # [..., blocks]: the decision per block, not yet per position
      return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 diff --git a/python/sglang/srt/layers/moe/kt_ep_wrapper.py b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
-index 36c15cf1..54c42a52 100644
+index 36c15cf1..036dc641 100644
 --- a/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 +++ b/python/sglang/srt/layers/moe/kt_ep_wrapper.py
 @@ -7,12 +7,14 @@ for any MoE quantization method. It coordinates parallel execution of GPU expert
@@ -863,12 +863,12 @@ index 36c15cf1..54c42a52 100644
  from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
  from sglang.srt.runtime_context import (
      get_exec,
-@@ -37,6 +39,37 @@ except ImportError:
+@@ -37,6 +39,42 @@ except ImportError:
      KTRANSFORMERS_AVAILABLE = False
  
  
 +
-+def _drop_checkpoint_cache(layer_idx: int) -> None:
++def _drop_checkpoint_cache(layer_idx: int, num_layers: int = 0) -> None:
 +    """KT_GPU_STREAM_DROP_CACHE=<dir>: posix_fadvise(DONTNEED) every file
 +    under it, so the arenas kt-kernel is about to create find free 2 MB
 +    blocks (patches/sglang-kt-drop-cache-per-layer.py)."""
@@ -880,8 +880,13 @@ index 36c15cf1..54c42a52 100644
 +        return
 +    # the loader's prefetch evicts each finished layer itself; a whole-tree
 +    # drop here would throw away the next layer's background read
++    # (the loader reads the last KT_LOAD_PREFETCH_TAIL layers after their
++    # arena exists; this drop runs again for them so the arena finds 2 MB
++    # blocks, as it did before the prefetch)
 +    if layer_idx > 0 and int(os.environ.get("KT_LOAD_PREFETCH", "0") or 0) > 0:
-+        return
++        tail = int(os.environ.get("KT_LOAD_PREFETCH_TAIL", "4"))
++        if not num_layers or layer_idx < num_layers - tail - 1:
++            return
 +    t0, n = time.time(), 0
 +    for root, _, files in os.walk(root_dir, followlinks=True):
 +        for name in files:
@@ -901,7 +906,7 @@ index 36c15cf1..54c42a52 100644
  @dataclass
  class KTConfig:
      """Configuration for KTransformers heterogeneous computing CPU part.
-@@ -114,6 +147,43 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
+@@ -114,6 +152,43 @@ def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.T
      return topk_ids
  
  
@@ -945,7 +950,7 @@ index 36c15cf1..54c42a52 100644
  class KTEPWrapperMethod(FusedMoEMethodBase):
      """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
  
-@@ -216,19 +286,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -216,19 +291,33 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          # 2. Initialize KT wrapper for CPU experts
          # CPU experts: num_gpu_experts to num_experts-1
          if self.tp_rank == 0:
@@ -980,11 +985,11 @@ index 36c15cf1..54c42a52 100644
              )
  
      def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-@@ -255,7 +339,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -255,7 +344,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                  .physical_to_logical_map_cpu[self.kt_config.layer_idx]
                  .contiguous()
              )
-+            _drop_checkpoint_cache(self.kt_config.layer_idx)
++            _drop_checkpoint_cache(self.kt_config.layer_idx, getattr(self.kt_config, "num_layers", 0) or 0)
              self.wrapper.load_weights(physical_to_logical_map_cpu)
 +        # Last layer loaded on this rank: optionally build the streamer and
 +        # pin every layer's arenas now (KT_GPU_STREAM_EARLY_INIT).
@@ -996,7 +1001,7 @@ index 36c15cf1..54c42a52 100644
  
      def create_moe_runner(
          self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-@@ -297,6 +389,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -297,6 +394,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          topk_output = dispatch_output.topk_output
          topk_weights, topk_ids, _ = topk_output
  
@@ -1011,7 +1016,7 @@ index 36c15cf1..54c42a52 100644
          # Submit forward task to CPU (non-blocking)
          self.wrapper.submit_forward(
              x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
-@@ -344,9 +444,48 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -344,9 +449,48 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
  
          x = dispatch_output.hidden_states
          topk_output = dispatch_output.topk_output
@@ -1061,7 +1066,7 @@ index 36c15cf1..54c42a52 100644
              self.submit(layer, dispatch_output)
  
          # Step 2: Prepare GPU computation by masking CPU expert IDs
-@@ -355,23 +494,66 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
+@@ -355,23 +499,66 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
          masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
  
          # Create modified dispatch output for GPU computation
@@ -4033,6 +4038,95 @@ index 59f5ea01..7132e3a7 100644
  
  
  class LayeredModelLoader(DefaultModelLoader):
+diff --git a/python/sglang/srt/model_loader/weight_utils.py b/python/sglang/srt/model_loader/weight_utils.py
+index fd659e7c..8e477ddc 100644
+--- a/python/sglang/srt/model_loader/weight_utils.py
++++ b/python/sglang/srt/model_loader/weight_utils.py
+@@ -1220,6 +1220,76 @@ def multi_thread_safetensors_weights_iterator(
+                 _drop_file_cache_after_load(st_file)
+ 
+ 
++_DENSE_PREFETCH_THREADS = int(os.environ.get("KT_LOAD_PREFETCH", "0") or 0)
++_DENSE_PREFETCH_PIECE = int(os.environ.get("KT_LOAD_PREFETCH_PIECE_MB", "16")) << 20
++_DENSE_PREFETCH_SKIP = re.compile(os.environ.get("KT_LOAD_PREFETCH_SKIP", r"\.experts\.|\.engram\.embed\."))
++
++
++def _prefetch_dense_tensors(st_file: str) -> None:
++    """KT_LOAD_PREFETCH=<threads>: pread this shard's tensors whose names do
++    not contain KT_LOAD_PREFETCH_SKIP (default `.mlp.experts.`) in 16 MiB
++    pieces on a thread pool, so the weight loaders' mmap faults find the
++    pages in the cache instead of reading one readahead window at a time."""
++    if _DENSE_PREFETCH_THREADS <= 0:
++        return
++    import time
++
++    t0 = time.time()
++    with open(st_file, "rb") as fh:
++        n = struct.unpack("<Q", fh.read(8))[0]
++        meta = json.loads(fh.read(n))
++    ranges = []
++    for k, v in meta.items():
++        if k == "__metadata__" or _DENSE_PREFETCH_SKIP.search(k):
++            continue
++        b, e = v["data_offsets"]
++        ranges.append((8 + n + b, e - b))
++    if not ranges:
++        return
++    ranges.sort()
++    merged = []
++    cur_off, cur_end = ranges[0][0], ranges[0][0] + ranges[0][1]
++    for off, sz in ranges[1:]:
++        if off <= cur_end + (1 << 20):
++            cur_end = max(cur_end, off + sz)
++        else:
++            merged.append((cur_off, cur_end))
++            cur_off, cur_end = off, off + sz
++    merged.append((cur_off, cur_end))
++    pieces = []
++    for a, b in merged:
++        p = a
++        while p < b:
++            pieces.append((p, min(_DENSE_PREFETCH_PIECE, b - p)))
++            p += _DENSE_PREFETCH_PIECE
++    local = threading.local()
++    fd = os.open(st_file, os.O_RDONLY)
++
++    def read(piece):
++        off, sz = piece
++        buf = getattr(local, "buf", None)
++        if buf is None or len(buf) < sz:
++            buf = local.buf = bytearray(max(sz, _DENSE_PREFETCH_PIECE))
++        mv = memoryview(buf)[:sz]
++        got = 0
++        while got < sz:
++            r = os.preadv(fd, [mv[got:]], off + got)
++            if r <= 0:
++                break
++            got += r
++        return got
++
++    try:
++        with concurrent.futures.ThreadPoolExecutor(_DENSE_PREFETCH_THREADS) as ex:
++            done = sum(ex.map(read, pieces))
++    finally:
++        os.close(fd)
++    logger.info(
++        "[dense prefetch] %s: %.2f GiB in %.2f s (%d tensors)",
++        os.path.basename(st_file), done / 2**30, time.time() - t0, len(ranges),
++    )
++
++
+ def buffered_multi_thread_safetensors_weights_iterator(
+     hf_weights_files: List[str],
+     max_workers: int,
+@@ -1247,6 +1317,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
+             with open(st_file, "rb") as f:
+                 result = safetensors.torch.load(f.read())
+         else:
++            _prefetch_dense_tensors(st_file)
+             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                 result = {k: f.get_tensor(k) for k in f.keys()}
+         return result
 diff --git a/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py b/python/sglang/srt/models/deepseek_common/wo_a_fp8_gemv.py
 new file mode 100644
 index 00000000..8e0a4cbd
@@ -4171,10 +4265,62 @@ index 8f3cf1da..dd9cea0c 100644
              pre_quant_input = None
              shared_output = None
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 228af858..978136d6 100644
+index 228af858..89f12141 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -182,6 +182,7 @@ from sglang.srt.models.deepseek_v2 import (
+@@ -19,6 +19,7 @@ from typing import (
+     Union,
+ )
+ 
++import re
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -48,6 +49,43 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+ from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
++
++
++_KT_EXPERT_NAME = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
++
++
++def _kt_cpu_only_experts(model) -> dict:
++    """{layer_id: frozenset(logical expert ids with no GPU slot)} for every
++    MoE layer whose quant method is the KT wrapper; {} when there is none or
++    KT_LOAD_SKIP_CPU_EXPERTS=0."""
++    import os
++
++    if os.environ.get("KT_LOAD_SKIP_CPU_EXPERTS", "1") != "1":
++        return {}
++    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
++    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
++    from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
++
++    meta = get_global_expert_location_metadata()
++    out = {}
++    for module in model.modules():
++        qm = getattr(module, "quant_method", None)
++        if not isinstance(module, FusedMoE) or not isinstance(qm, KTEPWrapperMethod):
++            continue
++        if qm.num_gpu_experts == -1 or getattr(module, "layer_id", None) is None:
++            continue
++        cpu_only = set()
++        for logical in range(meta.num_logical_experts):
++            on_gpu = False
++            for phys in meta.logical_to_all_physical(module.layer_id, logical):
++                local = module._map_global_expert_id_to_local_expert_id(phys)
++                if 0 <= local < module.num_local_experts and local < qm.num_gpu_experts:
++                    on_gpu = True
++                    break
++            if not on_gpu:
++                cpu_only.add(logical)
++        out[module.layer_id] = frozenset(cpu_only)
++    return out
+ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+ from sglang.srt.layers.attention.dsa.utils import (
+     can_dsa_cp_split,
+@@ -182,6 +220,7 @@ from sglang.srt.models.deepseek_v2 import (
  )
  from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
  from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -4182,7 +4328,7 @@ index 228af858..978136d6 100644
      image_token_types,
      materialize_image_gpu,
  )
-@@ -453,6 +454,40 @@ if _is_hip:
+@@ -453,6 +492,40 @@ if _is_hip:
              _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
  
  
@@ -4223,7 +4369,7 @@ index 228af858..978136d6 100644
  def _apply_wo_a_bf16_matmul(
      o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
  ) -> torch.Tensor:
-@@ -2062,7 +2097,14 @@ class MQALayer(MqaAttentionBase):
+@@ -2062,7 +2135,14 @@ class MQALayer(MqaAttentionBase):
                  o = output
              else:
                  wo_a_weight = getattr(self.wo_a, "weight", None)
@@ -4239,7 +4385,7 @@ index 228af858..978136d6 100644
                      wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                      o = _apply_wo_a_bf16_matmul(
                          o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
-@@ -4052,7 +4094,11 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4052,7 +4132,11 @@ class DeepseekV4ForCausalLM(nn.Module):
          self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
          self.determine_num_fused_shared_experts()
          self.vision = None
@@ -4252,7 +4398,7 @@ index 228af858..978136d6 100644
              if (
                  get_parallel().attn_cp_size != 1
                  or get_pp_group().world_size != 1
-@@ -4068,6 +4114,9 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4068,6 +4152,9 @@ class DeepseekV4ForCausalLM(nn.Module):
              self.image_start = nn.Parameter(torch.empty(config.hidden_size))
              self.image_end = nn.Parameter(torch.empty(config.hidden_size))
              self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
@@ -4262,7 +4408,7 @@ index 228af858..978136d6 100644
          self.model = DeepseekV4Model(
              config, quant_config, prefix=add_prefix("model", prefix)
          )
-@@ -4140,7 +4189,14 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4140,7 +4227,14 @@ class DeepseekV4ForCausalLM(nn.Module):
              )
              features = self.aligner(self.vision(patches, h, w), h, w)
              r = self.config.vision_downsample_ratio
@@ -4278,7 +4424,7 @@ index 228af858..978136d6 100644
              span = torch.empty(
                  (len(types), self.config.hidden_size), device=device, dtype=dtype
              )
-@@ -4148,6 +4204,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4148,6 +4242,8 @@ class DeepseekV4ForCausalLM(nn.Module):
              span[types == 1] = features.to(dtype)
              span[types == 2] = self.image_newline
              span[types == 3] = self.image_end
@@ -4287,7 +4433,7 @@ index 228af858..978136d6 100644
              spans.append(span)
          return spans
  
-@@ -4360,6 +4418,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -4360,6 +4456,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                  attn.wo_a.weight_scale_inv.format_ue8m0 = False
  
      def post_load_weights(self, is_nextn=False, weight_names=None):
@@ -4296,6 +4442,27 @@ index 228af858..978136d6 100644
          if self.wo_a_fp8:
              self._setup_fp8_wo_a_scales(is_nextn)
  
+@@ -4554,6 +4652,8 @@ class DeepseekV4ForCausalLM(nn.Module):
+ 
+         cache_compressor_weight = {}
+         COMPRESSOR_PART = ".compressor.w"
++        kt_cpu_only = _kt_cpu_only_experts(self) if not is_nextn else {}
++        kt_skipped = 0
+ 
+         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
+@@ -4608,6 +4708,11 @@ class DeepseekV4ForCausalLM(nn.Module):
+                         is_nextn=is_nextn,
+                         num_hidden_layers=self.config.num_hidden_layers,
+                     )
++                    if kt_cpu_only:
++                        m = _KT_EXPERT_NAME.match(name)
++                        if m and int(m.group(2)) in kt_cpu_only.get(int(m.group(1)), ()):
++                            kt_skipped += 1
++                            continue
+ 
+                     # V4.1 checkpoint tensors with no module in the text model yet;
+                     # the per-group count is logged after loading.
 diff --git a/python/sglang/srt/multimodal/deepseek_v41_image_processing.py b/python/sglang/srt/multimodal/deepseek_v41_image_processing.py
 index ab9ecd01..5490ed16 100644
 --- a/python/sglang/srt/multimodal/deepseek_v41_image_processing.py

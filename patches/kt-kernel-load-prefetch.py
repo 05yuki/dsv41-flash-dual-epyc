@@ -46,6 +46,10 @@ HELPER = '''
 
 _PREFETCH_THREADS = int(os.environ.get("KT_LOAD_PREFETCH", "0") or 0)
 _PREFETCH_PIECE = int(os.environ.get("KT_LOAD_PREFETCH_PIECE_MB", "16")) << 20
+# the last TAIL layers are read after their arena exists, not ahead of it: with
+# the next layer's pages in the cache the last arenas came out on 4 KB pages
+# and rank 1 took 70-200 s to register them (10-07)
+_PREFETCH_TAIL = int(os.environ.get("KT_LOAD_PREFETCH_TAIL", "4"))
 _header_cache: dict = {}
 _pending: dict = {}      # expert prefix -> Future of its prefetch, started during the previous layer
 _executor = None
@@ -276,6 +280,14 @@ s = once(
             _prefetch_ranges(self._ranges_for(keys_of(prefix, expert_count)))
 
         nxt = _next_prefix(prefix)
+        if nxt and _PREFETCH_TAIL > 0:
+            # how many layers remain after this one
+            m2 = re.search(r"(layers\\.)(\\d+)(\\.)", prefix)
+            last = int(m2.group(2))
+            while f"{prefix[: m2.start(2)]}{last + 1}{prefix[m2.end(2):]}.0.{proj_names[0]}.weight" in self.tensor_file_map:
+                last += 1
+            if last - int(m2.group(2)) <= _PREFETCH_TAIL:
+                nxt = None
         if nxt and f"{nxt}.0.{proj_names[0]}.weight" in self.tensor_file_map:
             count = 0
             while f"{nxt}.{count}.{proj_names[0]}.weight" in self.tensor_file_map:
