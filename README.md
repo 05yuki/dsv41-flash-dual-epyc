@@ -27,7 +27,7 @@ bought.
 | prefill, ~114K tokens | — | — | 114,166 tokens in 441 s (259 tok/s, 10-05) | 114,162 tokens in **191.6 s** (596 tok/s) |
 | prefill at depth 0 / 29k / 64k / 128k | — | — | 242 / 249 / 185 / 211 tok/s | — |
 | prefill chunk | 2048 | 2048 | 2048 | 6144, the widest that keeps the KV pool; calibrated with the lend probe up to 1M |
-| startup (476 GB loaded and pinned) | — | 60+ min | 11 min | 8-11 min; a setup's first launch adds one calibration launch (the probe itself takes 2 min) |
+| startup (476 GB loaded and pinned) | — | 60+ min | 11 min | **351 s** cold (740 s this morning; finding 18); a setup's first launch adds one calibration launch (the probe itself takes 2 min) |
 | context | 1M | 1M | 1M (the ladder ran at a 262K pool with radix on) | 1M, KV pool 1,048,576 tokens; a 989,154-token prompt prefills in **2,433.9 s** (406 tok/s, the first prefill after a launch) |
 
 ¹ With four of the six routed experts per token deferred (the launcher's
@@ -240,6 +240,39 @@ added after 09-11 and has not been traced yet.
       `expandable_segments`, which would remove the rest, is refused by
       torch_memory_saver.
 
+18. **The launch read the checkpoint one readahead window at a time
+    (10-07).** Nothing in the load path reads the expert weights explicitly:
+    kt-kernel's `load_weights` gets zero-copy views on safetensors' private
+    mmap and 64 worker threads `memcpy` each expert into the memfd arenas,
+    so the disk reads are the page faults those memcpys take, one readahead
+    window each (128 KiB on the root NVMe). Watched during a launch: the
+    drive at 0.9-1.4 GB/s, iowait 14-45%, every layer strictly after the
+    previous one, no prefetch. `madvise(WILLNEED)` over the layer changed
+    nothing (141 vs 142 s for Vision's 43 layers): the kernel clamps each
+    call to the same window.
+    - `kt-kernel-load-prefetch.py` (`KT_LOAD_PREFETCH=<threads>`, the
+      launchers set 4): the loader resolves each expert tensor's byte range
+      from the safetensors headers, merges neighbours, and preads them in
+      16 MiB pieces into a throwaway buffer; the copy then finds the pages
+      in the cache. While a layer copies, the next layer's read runs in the
+      background, and the previous layer's ranges are evicted with
+      `fadvise(DONTNEED)`, so the cache holds at most two layers.
+      `sglang-kt-drop-cache-skip-prefetch.py` keeps finding 12's whole-tree
+      drop for layer 0 only, since it would evict the background read.
+    - The drive matters. V4.1 sat on a DRAM-less BIWIN NV7400 (PCIe 4 x4),
+      which tops out at 1.75 GiB/s with 4 parallel readers and 2.6 with 32,
+      and fell to 0.9 GiB/s while the memcpy threads ran; the WD SN5100
+      next to it reads 6.3 GiB/s alone. The checkpoint moved to the SN5100
+      (byte-verified copy, 22 min).
+    - Cold page cache, expert layers / Load weight / launch to `/health`:
+      this morning 612 / 696 / 740 s; prefetch on the NV7400 223 / 377 /
+      434 s (the read still waited 205 s in total); prefetch on the SN5100
+      **129 / 286 / 351 s**, waits 24 s. Vision (147 GB) went 141 / 217 /
+      266 s to 52 / 124 / 170 s with 0.0 s of waiting. What is left in a
+      V4.1 launch: 129 s before the first expert layer (the dense shards and
+      the GPU experts), 129 s of expert layers at 3.3 s each (now the copy
+      itself), 28 s of arena pinning, 33 s of KV and graphs.
+
 Also in `docs/DSV41-DECODE-PROFILE-20260913.md`: the per-token budget as of
 09-13, and the profiler gotcha — SGLang's `/start_profile` wants the activity
 named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
@@ -249,13 +282,16 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
 - `patches/` — against `sgl-project/sglang` branch `dsv4.1` (commit
   1aa0e962) and `kvcache-ai/ktransformers` (commit 95009ea):
   - `sglang-dsv41-tree-20261007.patch` — the whole SGLang tree as running on
-    10-07, prefill lend, probe and the indexer fixes of finding 17 included
+    10-07, prefill lend, probe, the indexer fixes of finding 17 and the
+    cache-drop change of finding 18 included
     (supersedes `sglang-dsv41-tree-20260916.patch`, the SGLang `.py` patchers
     and the SGLang parts of the older `.patch` files; it also carries the
     V4-Flash-Vision path and a few switches that are off by default)
   - `kt-kernel-tree-20261006.patch` — the whole kt-kernel tree as running on
     10-06 (supersedes every kt-kernel `.patch` and `.py` below; they stay as
-    the record of what each change was)
+    the record of what each change was). `kt-kernel-load-prefetch.py` is not
+    in it: it edits the installed package's `kt_kernel/utils/loader.py`
+    (finding 18) and is applied on top
   - `sglang-dsv41-tree-20260916.patch` and the `.py` patchers — the same
     changes one at a time, each with its write-up in its docstring; they
     apply on top of the 09-16 tree patch in the order listed under
@@ -305,15 +341,18 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
    `sglang-kt-stream-shared-graph-inputs.py`, `sglang-dsv41-kt-prefill-lend.py`,
    `sglang-dsv4-swa-pool-floor.py`, `sglang-dsv4-candidate-mask-inplace.py`,
    `sglang-dsv4-candidate-mask-blocks.py`, `sglang-dsv4-indexer-slice-budget.py`,
-   `sglang-kt-stream-graph-keep.py`, `sglang-kt-lend-probe.py`, each with the
-   tree as its argument. That gives the same files V4.1 runs; the 10-07
+   `sglang-kt-stream-graph-keep.py`, `sglang-kt-lend-probe.py`,
+   `sglang-kt-drop-cache-skip-prefetch.py`, each with the tree as its
+   argument. That gives the same files V4.1 runs; the 10-07
    patch adds the Vision path.
 2. kvcache-ai/ktransformers at 95009ea with
    `patches/kt-kernel-tree-20261006.patch` (`git apply`; the submodules
    `third_party/llama.cpp` and `third_party/pybind11` at that commit's
    pins), built by `tools/build-kt-dsv41.sh`. The Python side of the
    installed `kt_kernel` package must match the tree's `kt-kernel/python/`.
-   `pip install torch_memory_saver` (0.0.9.post1) in the same venv.
+   `pip install torch_memory_saver` (0.0.9.post1) in the same venv. Then
+   `python patches/kt-kernel-load-prefetch.py <site-packages>` on the
+   installed package (finding 18).
 3. `vm.min_free_kbytes = 8388608` (a node-bound OOM from the CUDA JIT
    otherwise kills the scheduler while the experts sit in DRAM).
 4. Engram manifest per `docs/DSV41-ENGRAM-MXFP4.md`; `DSV41_ENGRAM_DIR`,
@@ -324,8 +363,10 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
    Without the first, pinning 4 KB shmem pages takes most of an hour; the
    launcher warns when it is `never`.
 6. `KT_GPU0_UUID=... KT_GPU1_UUID=... tools/start-dsv41-engram-nvme.sh`. The
-   streamed prefill, the Marlin hot experts, memops, both all-reduce paths and
-   the prefill lend are on by default. The first launch of a setup starts the
+   streamed prefill, the Marlin hot experts, memops, both all-reduce paths,
+   the prefill lend and the load prefetch (`KT_LOAD_PREFETCH=4`) are on by
+   default. Put the checkpoint on the fastest NVMe you have; the launch is
+   bound by it (finding 18). The first launch of a setup starts the
    server once more for calibration (the lend probe at prefix 0, half the
    context and its end, about two minutes once loaded) and keeps the chunk it
    measured in `~/.cache/kt-lend/`.

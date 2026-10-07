@@ -160,6 +160,11 @@ export SGLANG_UNBALANCED_LOAD_TIMEOUT_S="${SGLANG_UNBALANCED_LOAD_TIMEOUT_S:-180
 # (patches/sglang-kt-drop-cache-per-layer.py). 09-24: 328 of 337 GB huge,
 # startup 60+ min -> 11 min, NLL and decode unchanged.
 export KT_GPU_STREAM_DROP_CACHE="${KT_GPU_STREAM_DROP_CACHE:-$model}"
+# each expert layer's bytes are read into the page cache by 4 threads while
+# the previous layer copies (patches/kt-kernel-load-prefetch.py); 0 turns it off.
+# 10-07: expert layers 612 -> 129 s, launch 740 -> 351 s with the checkpoint on
+# the SN5100. On the NV7400 the drive itself held the read at 0.9 GiB/s.
+export KT_LOAD_PREFETCH="${KT_LOAD_PREFETCH:-4}"
 if grep -q '\[never\]' /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>/dev/null; then
   echo "WARNING: shmem THP is 'never'; the expert arenas will be 4K and pinning takes 20-60 min." >&2
   echo "         echo advise | sudo tee /sys/kernel/mm/transparent_hugepage/shmem_enabled" >&2
