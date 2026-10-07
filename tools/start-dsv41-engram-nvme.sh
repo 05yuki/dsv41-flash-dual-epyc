@@ -91,7 +91,7 @@ extra_args=(${SGLANG_EXTRA_ARGS:-})
 # its size, so a 48K prompt took 37 chunks / 283 s. Six prefix tails raise
 # the cap to 7424 and every chunk is 2048: 24 chunks / 198 s. Costs ~1 GB of
 # VRAM per rank (SWA slots carry the c4 state), which hot-5 leaves free.
-extra_args+=(--swa-prefix-tails "${SGLANG_SWA_PREFIX_TAILS:-6}")
+swa_prefix_tails="${SGLANG_SWA_PREFIX_TAILS:-6}"
 # The radix cache stays off in production. DSV41_RADIX=1 keeps it, for the
 # depth ladder (tools/sglang-ladder.py), where each stage must reuse the
 # previous stage's context to time only the new chunk.
@@ -256,13 +256,69 @@ KT_PREFILL_LEND="${KT_PREFILL_LEND:-1}"
 [[ -f "$source_dir/sglang/srt/layers/moe/kt_lend.py" ]] || KT_PREFILL_LEND=0  # tree without the patch
 export KT_PREFILL_LEND
 if [[ "$KT_PREFILL_LEND" == 1 ]]; then
+  # The KV pool comes first (10-07): a wider chunk needs a wider SWA cap, and on
+  # V4.1 each SWA slot costs several full ones. Chunk 10240 (20 tails) took the
+  # full pool to 896,000 (114K prompts 790 tok/s); 6144 with the six default
+  # tails keeps the whole 1,048,576. The lend chunk stays at or below
+  # DSV41_LEND_MAX_CHUNK unless SGLANG_CHUNKED_PREFILL_SIZE is given.
+  lend_max_chunk="${DSV41_LEND_MAX_CHUNK:-6144}"
+  export KT_PREFILL_LEND_MAX_CHUNK="$lend_max_chunk"
+  # the calibration measures with the lend probe up to the context's end (a
+  # 1M-token prompt is the case the chunk must survive; 10-07 the probe put a
+  # 6144-row chunk at 5,286 MiB of 5,609 free there, 2,921 of it allocated)
+  export KT_PREFILL_LEND_PROBE_CONTEXT="${KT_PREFILL_LEND_PROBE_CONTEXT:-$max_total_tokens}"
   # shellcheck source=kt-lend-auto.sh
   source "$root/tools/kt-lend-auto.sh"
+  # the lend takes nothing from the KV pool: kt-lend-auto's KV guard narrows a
+  # chunk whose wider SWA pool cost full-pool tokens on the last launch
+  export KT_PREFILL_LEND_KV_CAP="${KT_PREFILL_LEND_KV_CAP:-$max_total_tokens}"
   kt_lend_auto "$0" SGLANG_CHUNKED_PREFILL_SIZE "$port" "$model" "$context_length" "$max_total_tokens" \
     "$mem_fraction" "$gpu_devices" "$gpu_experts" "$placement" "${SGLANG_SWA_PREFIX_TAILS:-6}" || exit $?
   chunked_prefill="$KT_LEND_CHUNK"
-  echo "prefill lend: chunk $chunked_prefill" >&2
+  if [[ -z "${SGLANG_CHUNKED_PREFILL_SIZE:-}" ]] && (( chunked_prefill > lend_max_chunk )); then
+    chunked_prefill="$lend_max_chunk"
+  fi
+  # The SWA cap counts two chunks in flight, but with the overlap scheduler the
+  # previous chunk's slots are still held while the next is built, so with six
+  # tails every other batch gets 3072 of 6144 rows. Tails of chunk / 768 more
+  # fill them (10-07, chunk 6144: 14 tails, every batch 5888-6144 rows), but
+  # they come out of the KV pool (1,046,272 instead of 1,048,576; 22 tails cost
+  # 4.4%), so only with DSV41_LEND_FILL_TAILS=1: by default the lend takes
+  # nothing from the KV pool.
+  if [[ -z "${SGLANG_SWA_PREFIX_TAILS:-}" && "${DSV41_LEND_FILL_TAILS:-0}" == 1 ]]; then
+    swa_prefix_tails=$(( 6 + (chunked_prefill + 767) / 768 ))
+  elif [[ -z "${SGLANG_SWA_PREFIX_TAILS:-}" ]]; then
+    # As many of those tails as the KV pool's slack pays for, read from the
+    # last run: the pool sizer logs the full pool its budget allows before
+    # the cap cuts it to max_total_tokens (chunk 6144, 6 tails: 1,090,304 for
+    # 1,048,576), and each SWA slot costs 14.33 full ones here (6 -> 14 -> 22
+    # tails took 1,090,304 -> 1,046,272 -> 1,002,240), a tail 384 slots.
+    last_log="$(ls -td "$root/logs/$log_name"/2*/ 2>/dev/null | head -1)server.log"
+    if [[ -f "$last_log" ]]; then
+      swa_prefix_tails="$(python3 - "$last_log" "$max_total_tokens" "$chunked_prefill" \
+        "${DSV41_SWA_FULL_COST:-14.33}" <<'EOF'
+import re, sys
+log, cap, chunk, cost = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+text = open(log, errors="replace").read()
+sizes = re.findall(r"DSV4 pool sizes: full=(\d+)", text)
+tails = re.findall(r"DSV4 SWA sizing: mode=cap, .*prefix_tails=(\d+)", text)
+chunks = re.findall(r"'chunked_prefill_size': (\d+)", text)
+want = 6 + (chunk + 767) // 768
+if not sizes or not tails or not chunks:
+    print(6)
+    sys.exit()
+budget, ran, ran_chunk = int(sizes[0]), int(tails[0]), int(chunks[0])
+# SWA slots the slack pays for, less the two chunks in flight growing from the
+# last run's chunk to this one's; whole tails of what is left
+spare_slots = (budget - cap) / cost - 2 * (chunk - ran_chunk)
+print(max(6, min(want, ran + int(spare_slots // 384))))
+EOF
+)"
+    fi
+  fi
+  echo "prefill lend: chunk $chunked_prefill, SWA prefix tails $swa_prefix_tails" >&2
 fi
+extra_args+=(--swa-prefix-tails "$swa_prefix_tails")
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 run_dir="$root/logs/$log_name/$timestamp"

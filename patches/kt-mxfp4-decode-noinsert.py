@@ -12,11 +12,16 @@ every position), so the output is too.
 
 Apply once to source/ktransformers-gemma4/kt-kernel, then
 native-ubuntu/build-kt-dsv41.sh.
+Usage: python kt-mxfp4-decode-noinsert.py [ktransformers tree]   (default source/ktransformers-gemma4)
 """
+import sys
 from pathlib import Path
 
-F = Path.home() / "KTransformers/source/ktransformers-gemma4/kt-kernel/operators/avx2/mxfp4-moe.hpp"
+F = (Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "KTransformers/source/ktransformers-gemma4") / "kt-kernel/operators/avx2/mxfp4-moe.hpp"
 s = F.read_text()
+if "lane_shift" in s:
+    print(f"already patched {F.name}")
+    raise SystemExit(0)
 start = s.index("if (group_size == 32 && (k % 32) == 0")
 end = s.index("#undef KT_MXFP4_DECODE_GROUP", start)
 fast = s[start:end]

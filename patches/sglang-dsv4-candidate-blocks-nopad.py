@@ -10,11 +10,16 @@ the full blocks in place and the tail block separately; same scores, one
 [T, blocks] result.
 
 Apply once to source/sglang-dsv41.
+Usage: python sglang-dsv4-candidate-blocks-nopad.py [sglang tree]   (default source/sglang-dsv41)
 """
+import sys
 from pathlib import Path
 
-F = (Path.home() / "KTransformers/source/sglang-dsv41/python/sglang/srt/layers/attention/dsv4/indexer.py")
+F = (Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "KTransformers/source/sglang-dsv41") / "python/sglang/srt/layers/attention/dsv4/indexer.py"
 s = F.read_text()
+if "no padded copy of the [T, prefix] logits" in s:
+    print(f"already patched {F.name}")
+    raise SystemExit(0)
 old = '''    width = logits.size(-1)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)

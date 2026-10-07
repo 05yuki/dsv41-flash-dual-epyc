@@ -16,11 +16,16 @@ Pages still mapped are left alone by the kernel, so a reader that still holds
 a shard is not affected; anything dropped and needed again is re-read.
 
 Apply once to source/sglang-dsv41.
+Usage: python sglang-kt-drop-cache-per-layer.py [sglang tree]   (default source/sglang-dsv41)
 """
+import sys
 from pathlib import Path
 
-F = (Path.home() / "KTransformers/source/sglang-dsv41/python/sglang/srt/layers/moe/kt_ep_wrapper.py")
+F = (Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "KTransformers/source/sglang-dsv41") / "python/sglang/srt/layers/moe/kt_ep_wrapper.py"
 s = F.read_text()
+if "KT_GPU_STREAM_DROP_CACHE" in s:
+    print(f"already patched {F.name}")
+    raise SystemExit(0)
 
 
 def once(old, new, text):

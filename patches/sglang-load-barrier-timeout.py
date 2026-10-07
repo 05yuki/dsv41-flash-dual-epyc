@@ -9,12 +9,16 @@ and 09-23 21:55, each after a 20-minute load. The wait is not a hang, so the
 V4.1 launcher gives it 1800 s.
 
 Apply once to source/sglang-dsv41.
+Usage: python sglang-load-barrier-timeout.py [sglang tree]   (default source/sglang-dsv41)
 """
+import sys
 from pathlib import Path
 
-F = (Path.home() / "KTransformers/source/sglang-dsv41/python/sglang/srt/"
-     "model_executor/model_runner_components/load_model_utils.py")
+F = (Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "KTransformers/source/sglang-dsv41") / "python/sglang/srt/model_executor/model_runner_components/load_model_utils.py"
 s = F.read_text()
+if "SGLANG_UNBALANCED_LOAD_TIMEOUT_S" in s:
+    print(f"already patched {F.name}")
+    raise SystemExit(0)
 old = "UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing\n"
 if s.count(old) != 1:
     raise SystemExit("anchor found %d times" % s.count(old))

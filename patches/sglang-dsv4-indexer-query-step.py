@@ -13,11 +13,16 @@ masks are concatenated per request as before. Same numbers, one slice's
 scores live at a time.
 
 Apply once to source/sglang-dsv41.
+Usage: python sglang-dsv4-indexer-query-step.py [sglang tree]   (default source/sglang-dsv41)
 """
+import sys
 from pathlib import Path
 
-F = (Path.home() / "KTransformers/source/sglang-dsv41/python/sglang/srt/layers/attention/deepseek_v4_backend.py")
+F = (Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "KTransformers/source/sglang-dsv41") / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
 s = F.read_text()
+if "SGLANG_DSV41_INDEXER_QUERY_STEP" in s:
+    print(f"already patched {F.name}")
+    raise SystemExit(0)
 
 
 def once(old, new, text):

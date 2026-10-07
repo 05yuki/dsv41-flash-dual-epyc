@@ -1,0 +1,2975 @@
+diff --git a/kt-kernel/cpu_backend/cpuinfer.h b/kt-kernel/cpu_backend/cpuinfer.h
+index 8366d1c..f18392b 100644
+--- a/kt-kernel/cpu_backend/cpuinfer.h
++++ b/kt-kernel/cpu_backend/cpuinfer.h
+@@ -10,8 +10,13 @@
+ #ifndef CPUINFER_CPUINFER_H
+ #define CPUINFER_CPUINFER_H
+ 
++#include <dlfcn.h>
++
+ #include <atomic>
+ #include <condition_variable>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
+ #include <functional>
+ #include <mutex>
+ #include <queue>
+@@ -39,6 +44,7 @@ class CPUInfer {
+     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+     backend_ = new WorkerPool(thread_num);
+     task_queue_ = new TaskQueue();
++    memops_init();
+     for (int i = 0; i < (1 << 16); ++i) {
+       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
+     }
+@@ -47,6 +53,7 @@ class CPUInfer {
+     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+     backend_ = new WorkerPool(thread_num, numa_id);
+     task_queue_ = new TaskQueue();
++    memops_init();
+     for (int i = 0; i < (1 << 16); ++i) {
+       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
+     }
+@@ -56,6 +63,7 @@ class CPUInfer {
+     printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+     backend_ = new WorkerPool(config);
+     task_queue_ = new TaskQueue();
++    memops_init();
+     for (int i = 0; i < (1 << 16); ++i) {
+       ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
+     }
+@@ -63,6 +71,10 @@ class CPUInfer {
+ 
+   ~CPUInfer() {
+     printf("CPUInfer[0x%lx]: Goodbye\n", (intptr_t)this);
++    if (mpoller_.joinable()) {
++      mstop_.store(true);
++      mpoller_.join();
++    }
+     delete backend_;
+     delete task_queue_;
+   }
+@@ -90,6 +102,11 @@ class CPUInfer {
+     void (*func)(void*) = (void (*)(void*))params.first;
+     void* args = (void*)params.second;
+     *((CPUInfer**)args) = this;
++    if (mflags_ != nullptr) {
++      const int idx = memop_arm((cudaStream_t)user_cuda_stream, func, args, false, 0);
++      write32_((void*)user_cuda_stream, req_dev(idx), 1, 0);
++      return;
++    }
+     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func, args);
+ #endif
+   }
+@@ -113,6 +130,13 @@ class CPUInfer {
+   void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0) {
+ #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
+     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA)
++    if (mflags_ != nullptr) {
++      const int idx = memop_arm((cudaStream_t)user_cuda_stream, nullptr, nullptr, true, allow_n_pending);
++      write32_((void*)user_cuda_stream, req_dev(idx), 1, 0);
++      wait32_((void*)user_cuda_stream, done_dev(idx), 1, 0x1 /* CU_STREAM_WAIT_VALUE_EQ */);
++      write32_((void*)user_cuda_stream, done_dev(idx), 0, 0);
++      return;
++    }
+     SyncArgs* args = new SyncArgs{this, allow_n_pending};
+     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
+ #endif
+@@ -121,6 +145,121 @@ class CPUInfer {
+  public:
+   WorkerPool* backend_;
+   TaskQueue* task_queue_;
++
++ private:
++  // ---- KT_STREAM_MEMOPS (native-ubuntu/patches/kt-stream-memops.py) ----
++  struct MemopEntry {
++    void (*func)(void*);
++    void* args;
++    size_t allow;
++    int idx;
++    bool sync;
++    bool permanent;
++  };
++  typedef int (*StreamValueFn)(void*, unsigned long long, unsigned int, unsigned int);
++  static constexpr int kRing = 4096, kPerm = 4096, kStride = 16;  // 16 x u32 = one cache line
++  StreamValueFn write32_ = nullptr, wait32_ = nullptr;
++  volatile uint32_t* mflags_ = nullptr;
++  uint32_t* mflags_dev_ = nullptr;
++  std::atomic<int> ring_next_{0}, perm_next_{0};
++  std::mutex mmtx_;
++  std::vector<MemopEntry> mentries_;
++  std::atomic<uint64_t> mversion_{0};
++  std::thread mpoller_;
++  std::atomic<bool> mstop_{false};
++
++  volatile uint32_t* req_host(int i) { return mflags_ + (size_t)i * 2 * kStride; }
++  volatile uint32_t* done_host(int i) { return mflags_ + (size_t)i * 2 * kStride + kStride; }
++  unsigned long long req_dev(int i) { return (unsigned long long)(mflags_dev_ + (size_t)i * 2 * kStride); }
++  unsigned long long done_dev(int i) {
++    return (unsigned long long)(mflags_dev_ + (size_t)i * 2 * kStride + kStride);
++  }
++
++  void memops_init() {
++#if defined(KTRANSFORMERS_USE_CUDA)
++    const char* on = getenv("KT_STREAM_MEMOPS");
++    if (on == nullptr || on[0] != '1') return;
++    void* h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
++    if (h != nullptr) {
++      write32_ = (StreamValueFn)dlsym(h, "cuStreamWriteValue32_v2");
++      wait32_ = (StreamValueFn)dlsym(h, "cuStreamWaitValue32_v2");
++    }
++    const size_t bytes = (size_t)(kRing + kPerm) * 2 * kStride * sizeof(uint32_t);
++    void* host = nullptr;
++    void* dev = nullptr;
++    if (write32_ == nullptr || wait32_ == nullptr ||
++        cudaHostAlloc(&host, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
++        cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
++      printf("[kt-memops] unavailable, keeping host functions\n");
++      return;
++    }
++    std::memset(host, 0, bytes);
++    mflags_dev_ = (uint32_t*)dev;
++    mflags_ = (volatile uint32_t*)host;
++    mpoller_ = std::thread(&CPUInfer::memop_poller, this);
++    printf("[kt-memops] CPUInfer[0x%lx]: stream memops on, %d ring + %d graph slots\n", (intptr_t)this, kRing,
++           kPerm);
++#endif
++  }
++
++  int memop_arm(cudaStream_t st, void (*func)(void*), void* args, bool sync, size_t allow) {
++    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
++    cudaStreamIsCapturing(st, &cs);
++    const bool perm = cs == cudaStreamCaptureStatusActive;
++    int idx;
++    if (perm) {
++      const int n = perm_next_.fetch_add(1);
++      if (n >= kPerm) throw std::runtime_error("KT_STREAM_MEMOPS: out of graph slots");
++      idx = kRing + n;
++    } else {
++      idx = ring_next_.fetch_add(1) % kRing;
++    }
++    std::lock_guard<std::mutex> g(mmtx_);
++    mentries_.push_back(MemopEntry{func, args, allow, idx, sync, perm});
++    mversion_.fetch_add(1, std::memory_order_release);
++    return idx;
++  }
++
++  void memop_poller() {
++    std::vector<MemopEntry> snap;
++    uint64_t seen = ~0ull;
++    while (!mstop_.load(std::memory_order_relaxed)) {
++      const uint64_t v = mversion_.load(std::memory_order_acquire);
++      if (v != seen) {
++        std::lock_guard<std::mutex> g(mmtx_);
++        snap = mentries_;
++        seen = mversion_.load(std::memory_order_acquire);
++      }
++      std::vector<int> retire;
++      // Arming order is stream order, so within one scan a submit is handled
++      // before the sync that follows it.
++      for (const MemopEntry& e : snap) {
++        if (*req_host(e.idx) != 1) continue;
++        *req_host(e.idx) = 0;
++        if (!e.sync) {
++          e.func(e.args);
++        } else {
++          task_queue_->sync(e.allow);
++          std::atomic_thread_fence(std::memory_order_release);
++          *done_host(e.idx) = 1;
++        }
++        if (!e.permanent) retire.push_back(e.idx);
++      }
++      __builtin_ia32_pause();
++      if (!retire.empty()) {
++        std::lock_guard<std::mutex> g(mmtx_);
++        for (int idx : retire) {
++          for (size_t i = 0; i < mentries_.size(); i++) {
++            if (!mentries_[i].permanent && mentries_[i].idx == idx) {
++              mentries_.erase(mentries_.begin() + i);
++              break;
++            }
++          }
++        }
++        mversion_.fetch_add(1, std::memory_order_release);
++      }
++    }
++  }
+ };
+ 
+ #endif
+diff --git a/kt-kernel/cpu_backend/task_queue.cpp b/kt-kernel/cpu_backend/task_queue.cpp
+index b38f360..876af4d 100644
+--- a/kt-kernel/cpu_backend/task_queue.cpp
++++ b/kt-kernel/cpu_backend/task_queue.cpp
+@@ -15,8 +15,12 @@
+ #include <chrono>
+ #include <iostream>
+ #include <thread>
++#include <cstdlib>
++#include <cstdio>
+ 
+ TaskQueue::TaskQueue() : done(false), pending(0) {
++  if (const char* e = getenv("KT_TASKQUEUE_TIMING")) timing_every = atoi(e);
++  if (const char* e = getenv("KT_TASKQUEUE_SPIN_US")) spin_us = atoi(e);
+   Node* dummy = new Node();
+   head.store(dummy, std::memory_order_relaxed);
+   tail.store(dummy, std::memory_order_relaxed);
+@@ -42,6 +46,7 @@ TaskQueue::~TaskQueue() {
+ void TaskQueue::enqueue(std::function<void()> task) {
+   pending.fetch_add(1, std::memory_order_acq_rel);
+   Node* node = new Node(task);
++  if (timing_every) node->t_enq = now_ns();
+   Node* prev = tail.exchange(node, std::memory_order_acq_rel);
+   prev->next.store(node, std::memory_order_release);
+   {
+@@ -52,6 +57,14 @@ void TaskQueue::enqueue(std::function<void()> task) {
+ 
+ void TaskQueue::sync(size_t allow_n_pending) {
+   std::exception_ptr task_exception;
++  const uint64_t t0 = timing_every ? now_ns() : 0;
++  if (timing_every && pending.load(std::memory_order_acquire) <= allow_n_pending)
++    sync_zero.fetch_add(1, std::memory_order_relaxed);
++  if (spin_us > 0) {
++    const uint64_t until = now_ns() + uint64_t(spin_us) * 1000;
++    while (pending.load(std::memory_order_acquire) > allow_n_pending && now_ns() < until) {
++    }
++  }
+   {
+     std::unique_lock<std::mutex> lock(mtx);
+     cv.wait(lock, [&] {
+@@ -61,6 +74,20 @@ void TaskQueue::sync(size_t allow_n_pending) {
+     task_exception = first_exception;
+     first_exception = nullptr;
+   }
++  if (timing_every) {
++    sync_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
++    const uint64_t n = n_syncs.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (n % uint64_t(timing_every) == 0) {
++      const uint64_t nt = n_tasks.exchange(0), qn = q_ns.exchange(0), rn = run_ns.exchange(0);
++      const uint64_t sn = sync_ns.exchange(0), sz = sync_zero.exchange(0);
++      fprintf(stderr,
++              "[kt-timing] %d syncs: tasks=%llu queue_wait=%.0f us/task run=%.0f us/task "
++              "(run total %.1f ms) | sync_wait=%.0f us/sync (total %.1f ms), %llu syncs found nothing pending\n",
++              timing_every, (unsigned long long)nt, nt ? qn / 1e3 / nt : 0.0, nt ? rn / 1e3 / nt : 0.0,
++              rn / 1e6, sn / 1e3 / timing_every, sn / 1e6, (unsigned long long)sz);
++      fflush(stderr);
++    }
++  }
+   if (task_exception) std::rethrow_exception(task_exception);
+ }
+ 
+@@ -71,11 +98,18 @@ void TaskQueue::worker() {
+     if (next) {
+       std::exception_ptr task_exception;
+       if (next->task) {
++        const uint64_t ts = timing_every ? now_ns() : 0;
+         try {
+           next->task();
+         } catch (...) {
+           task_exception = std::current_exception();
+         }
++        if (timing_every) {
++          const uint64_t te = now_ns();
++          n_tasks.fetch_add(1, std::memory_order_relaxed);
++          q_ns.fetch_add(ts - next->t_enq, std::memory_order_relaxed);
++          run_ns.fetch_add(te - ts, std::memory_order_relaxed);
++        }
+       }
+       delete curr;
+       curr = next;
+@@ -89,6 +123,13 @@ void TaskQueue::worker() {
+       }
+       cv.notify_all();
+     } else {
++      if (spin_us > 0) {
++        const uint64_t until = now_ns() + uint64_t(spin_us) * 1000;
++        while (curr->next.load(std::memory_order_acquire) == nullptr &&
++               !done.load(std::memory_order_acquire) && now_ns() < until) {
++        }
++        if (curr->next.load(std::memory_order_acquire) != nullptr) continue;
++      }
+       std::unique_lock<std::mutex> lock(mtx);
+       cv.wait(lock, [&] {
+         return curr->next.load(std::memory_order_acquire) != nullptr
+diff --git a/kt-kernel/cpu_backend/task_queue.h b/kt-kernel/cpu_backend/task_queue.h
+index cbcd2e6..42941f4 100644
+--- a/kt-kernel/cpu_backend/task_queue.h
++++ b/kt-kernel/cpu_backend/task_queue.h
+@@ -11,6 +11,8 @@
+ #define CPUINFER_TASKQUEUE_H
+ 
+ #include <atomic>
++#include <chrono>
++#include <cstdint>
+ #include <condition_variable>
+ #include <exception>
+ #include <functional>
+@@ -32,10 +34,23 @@ class TaskQueue {
+   struct Node {
+     std::function<void()> task;
+     std::atomic<Node*> next;
++    uint64_t t_enq = 0;
+     Node() : task(nullptr), next(nullptr) {}
+     Node(const std::function<void()>& t) : task(t), next(nullptr) {}
+   };
+ 
++  // KT_TASKQUEUE_TIMING=<syncs>: every that many sync() calls, print how long
++  // tasks waited in the queue, how long they ran, and how long sync() blocked,
++  // to stderr. One sync per MoE layer in decode, so 400 = ten tokens.
++  int timing_every = 0;
++  // KT_TASKQUEUE_SPIN_US: spin this long before a condition-variable wait.
++  int spin_us = 0;
++  std::atomic<uint64_t> n_tasks{0}, q_ns{0}, run_ns{0}, n_syncs{0}, sync_ns{0}, sync_zero{0};
++  static uint64_t now_ns() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
++
+   std::atomic<Node*> head;
+   std::atomic<Node*> tail;
+   std::atomic<bool> done;
+diff --git a/kt-kernel/ext_bindings.cpp b/kt-kernel/ext_bindings.cpp
+index 80bc2b2..f7a7979 100644
+--- a/kt-kernel/ext_bindings.cpp
++++ b/kt-kernel/ext_bindings.cpp
+@@ -470,6 +470,10 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
+       .def("load_weights", &MoeClass::load_weights)
+       .def("forward", &MoeClass::forward_binding);
+ 
++  if constexpr (requires { &MoeClass::expert_arena_infos; }) {
++    moe_cls.def("expert_arena_infos", &MoeClass::expert_arena_infos);
++  }
++
+   // Bind write_weight_scale_to_buffer_task for MoE types that support it
+   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
+   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {
+@@ -827,6 +831,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
+       // V4-Flash 2604B SwiGLU clamp limit (0.0 = disabled). See common.hpp.
+       .def_readwrite("swiglu_limit", &GeneralMOEConfig::swiglu_limit)
+       .def_readwrite("swiglu_alpha", &GeneralMOEConfig::swiglu_alpha)
++      .def_readwrite("activation_type", &GeneralMOEConfig::activation_type)
+ 
+       ;
+ 
+diff --git a/kt-kernel/operators/avx2/avx2_bf16_utils.hpp b/kt-kernel/operators/avx2/avx2_bf16_utils.hpp
+index d39cda9..c116321 100644
+--- a/kt-kernel/operators/avx2/avx2_bf16_utils.hpp
++++ b/kt-kernel/operators/avx2/avx2_bf16_utils.hpp
+@@ -168,6 +168,35 @@ static inline __m256 act_fn(__m256 gate_val, __m256 up_val, float swiglu_limit,
+   return act_fn(gate_val, up_val, swiglu_limit);
+ }
+ 
++// Gemma 4 GeGLU activation:
++//   gelu_pytorch_tanh(gate) * up
++// tanh(z) is evaluated as 2 * sigmoid(2z) - 1 so the existing AVX2 exp
++// approximation can be reused without introducing a scalar lane fallback.
++static inline __m256 gelu_tanh_fn(__m256 gate_val, __m256 up_val) {
++  const __m256 one = _mm256_set1_ps(1.0f);
++  const __m256 two = _mm256_set1_ps(2.0f);
++  const __m256 half = _mm256_set1_ps(0.5f);
++  const __m256 sqrt_two_over_pi = _mm256_set1_ps(0.7978845608028654f);
++  const __m256 cubic_coeff = _mm256_set1_ps(0.044715f);
++
++  const __m256 x2 = _mm256_mul_ps(gate_val, gate_val);
++  const __m256 x3 = _mm256_mul_ps(x2, gate_val);
++  const __m256 inner = _mm256_mul_ps(
++      sqrt_two_over_pi,
++      _mm256_add_ps(gate_val, _mm256_mul_ps(cubic_coeff, x3)));
++
++  __m256 neg_two_inner = _mm256_mul_ps(_mm256_set1_ps(-2.0f), inner);
++  // Outside this interval tanh already rounds to +/-1 at BF16 precision.
++  neg_two_inner = _mm256_max_ps(neg_two_inner, _mm256_set1_ps(-88.0f));
++  neg_two_inner = _mm256_min_ps(neg_two_inner, _mm256_set1_ps(88.0f));
++  const __m256 exp_neg_two_inner = exp_avx2(neg_two_inner);
++  const __m256 tanh_inner = _mm256_sub_ps(
++      _mm256_div_ps(two, _mm256_add_ps(one, exp_neg_two_inner)), one);
++  const __m256 gelu = _mm256_mul_ps(
++      _mm256_mul_ps(half, gate_val), _mm256_add_ps(one, tanh_inner));
++  return _mm256_mul_ps(gelu, up_val);
++}
++
+ }  // namespace avx2
+ 
+ #endif  // CPUINFER_OPERATOR_AVX2_BF16_UTILS_H
+diff --git a/kt-kernel/operators/avx2/bf16-moe.hpp b/kt-kernel/operators/avx2/bf16-moe.hpp
+index 2acd9a6..5ca0d1b 100644
+--- a/kt-kernel/operators/avx2/bf16-moe.hpp
++++ b/kt-kernel/operators/avx2/bf16-moe.hpp
+@@ -227,6 +227,14 @@ class TP_MOE<AVX2_BF16_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_BF16_MOE
+   using Base = TP_MOE<AVX2_MOE_BASE<K, AVX2_BF16_MOE_TP<K>>>;
+   using Base::Base;
+ 
++  // Per TP part: (fd, size, stride) of the gate, up and down weight arenas
++  // (KT_EXPERT_SHM=1), for the GPU-streamed prefill's zero-copy DMA.
++  std::vector<std::vector<std::tuple<int, size_t, size_t>>> expert_arena_infos() const {
++    std::vector<std::vector<std::tuple<int, size_t, size_t>>> out;
++    for (size_t i = 0; i < this->tps.size(); i++) out.push_back(this->tps[i]->expert_arena_info());
++    return out;
++  }
++
+   void load_weights() override {
+     auto& config = this->config;
+     auto& tps = this->tps;
+@@ -243,6 +251,11 @@ class TP_MOE<AVX2_BF16_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_BF16_MOE
+ 
+     pool->dispense_backend()->do_numa_job([&, this](int i) {
+       auto& tpc = tps[i]->config_;
++      // The per-part load_weights() maps physical slot -> logical expert
++      // through its own config; without this the placement was applied to
++      // the staging copy only and every CPU slot ended up holding logical
++      // expert p (09-14: hot-expert placement silently ignored on the CPU).
++      tpc.physical_to_logical_map = config.physical_to_logical_map;
+       const size_t tp_weight_elems = (size_t)tpc.intermediate_size * tpc.hidden_size;
+ 
+       // Allocate temporary BF16 buffers for this TP part
+diff --git a/kt-kernel/operators/avx2/moe_base.hpp b/kt-kernel/operators/avx2/moe_base.hpp
+index e626537..a3f2a2e 100644
+--- a/kt-kernel/operators/avx2/moe_base.hpp
++++ b/kt-kernel/operators/avx2/moe_base.hpp
+@@ -11,6 +11,9 @@
+ #ifndef CPUINFER_OPERATOR_AVX2_MOE_BASE_H
+ #define CPUINFER_OPERATOR_AVX2_MOE_BASE_H
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <immintrin.h>
+ 
+ #include <algorithm>
+@@ -23,6 +26,9 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <memory>
++#include <sys/mman.h>
++#include <tuple>
++#include <unistd.h>
+ #include <string>
+ #include <utility>
+ #include <vector>
+@@ -35,6 +41,28 @@
+ #include "avx2_bf16_utils.hpp"
+ #include "llama.cpp/ggml.h"
+ 
++// KT_DECODE_PHASES=<calls>: see native-ubuntu/patches/kt-decode-phase-timing.py
++namespace kt_decode_phases {
++inline int every() {
++  static const int n = [] {
++    const char* e = std::getenv("KT_DECODE_PHASES");
++    return e ? std::atoi(e) : 0;
++  }();
++  return n;
++}
++struct Part {
++  double t[4] = {0, 0, 0, 0};
++  long calls = 0, experts = 0;
++};
++inline Part& part(int i) {
++  static Part parts[16];
++  return parts[i & 15];
++}
++inline double us(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
++  return std::chrono::duration<double, std::micro>(b - a).count();
++}
++}  // namespace kt_decode_phases
++
+ template <class T, class Derived>
+ class AVX2_MOE_BASE {
+  public:
+@@ -63,6 +91,43 @@ class AVX2_MOE_BASE {
+   std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
+ 
+   std::vector<void*> owned_aligned_allocs_;
++  // KT_EXPERT_SHM=1: expert weight blocks live in memfd-backed shared
++  // mappings, one per projection (gate, up, down), expert i at base + i *
++  // stride, so a GPU rank in another process can map the same pages and DMA
++  // straight from the resident copy (streamed prefill, 09-14).
++  struct ExpertArena {
++    int fd = -1;
++    uint8_t* base = nullptr;
++    size_t size = 0, stride = 0;
++  };
++  std::vector<ExpertArena> expert_arenas_;
++  static bool expert_shm_enabled() {
++    static const bool on = getenv("KT_EXPERT_SHM") != nullptr && getenv("KT_EXPERT_SHM")[0] == '1';
++    return on;
++  }
++  static ExpertArena make_expert_arena(size_t block, size_t count, const char* name) {
++    ExpertArena a;
++    a.stride = (block + 63) & ~63ULL;
++    a.size = a.stride * count;
++    a.fd = memfd_create(name, 0);
++    if (a.fd < 0) throw std::runtime_error("memfd_create failed for expert arena");
++    if (ftruncate(a.fd, (off_t)a.size) != 0) throw std::runtime_error("ftruncate failed for expert arena");
++    void* m = mmap(nullptr, a.size, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, 0);
++    if (m == MAP_FAILED) throw std::runtime_error("mmap failed for expert arena");
++    // 2 MB pages when /sys/kernel/mm/transparent_hugepage/shmem_enabled
++    // allows it (advise/always): cudaHostRegister of a 4 KB-paged 4.2 GB
++    // arena took 3-38 s per layer through the IOMMU (09-13); the DMA engine
++    // also prefers them.
++    madvise(m, a.size, MADV_HUGEPAGE);
++    a.base = (uint8_t*)m;
++    return a;
++  }
++  static void free_expert_arena(ExpertArena& a) {
++    if (a.base) munmap(a.base, a.size);
++    if (a.fd >= 0) close(a.fd);
++    a.base = nullptr;
++    a.fd = -1;
++  }
+ 
+   size_t pool_count_ = 0;
+   size_t gate_up_ba_pool_bytes_ = 0;
+@@ -112,6 +177,29 @@ class AVX2_MOE_BASE {
+     m_local_up_output_ptr_.resize(config_.expert_num);
+     m_local_down_output_ptr_.resize(config_.expert_num);
+ 
++    // KT_EXPERT_SHM=1: per-expert loaders keep the packed weights in the TP
++    // class's per-part buffers, so the base block only ever holds the fp32
++    // group scales; allocate scale-only arenas and scale-only BufferBs.
++    const bool use_expert_shm = expert_shm_enabled() && kHasScaleOnlyBufferB;
++    // Backends whose BufferB is the plain weight matrix (BF16): the whole
++    // BufferB goes into the arenas, so the GPU can DMA it as is.
++    const bool use_full_shm = expert_shm_enabled() && !kHasScaleOnlyBufferB;
++    if (use_expert_shm) {
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_scale_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_gate_s"));
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_scale_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_up_s"));
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_scale_size(config_.hidden_size, config_.intermediate_size), config_.expert_num, "kt_down_s"));
++    } else if (use_full_shm) {
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_required_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_gate_w"));
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_required_size(config_.intermediate_size, config_.hidden_size), config_.expert_num, "kt_up_w"));
++      expert_arenas_.push_back(make_expert_arena(
++          buffer_b_required_size(config_.hidden_size, config_.intermediate_size), config_.expert_num, "kt_down_w"));
++    }
++
+     for (size_t i = 0; i < config_.expert_num; i++) {
+       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
+       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
+@@ -119,23 +207,34 @@ class AVX2_MOE_BASE {
+       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
+       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
+ 
+-      void* gate_bb_ptr = std::aligned_alloc(
+-          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+-      if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
+-      owned_aligned_allocs_.push_back(gate_bb_ptr);
+-      gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
+-
+-      void* up_bb_ptr = std::aligned_alloc(
+-          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+-      if (!up_bb_ptr) throw std::runtime_error("aligned_alloc failed for up BufferB");
+-      owned_aligned_allocs_.push_back(up_bb_ptr);
+-      up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
+-
+-      void* down_bb_ptr = std::aligned_alloc(
+-          64, (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~63ULL);
+-      if (!down_bb_ptr) throw std::runtime_error("aligned_alloc failed for down BufferB");
+-      owned_aligned_allocs_.push_back(down_bb_ptr);
+-      down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
++      void *gate_bb_ptr, *up_bb_ptr, *down_bb_ptr;
++      if (use_expert_shm || use_full_shm) {
++        gate_bb_ptr = expert_arenas_[0].base + i * expert_arenas_[0].stride;
++        up_bb_ptr = expert_arenas_[1].base + i * expert_arenas_[1].stride;
++        down_bb_ptr = expert_arenas_[2].base + i * expert_arenas_[2].stride;
++      } else {
++        gate_bb_ptr = std::aligned_alloc(
++            64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
++        if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
++        owned_aligned_allocs_.push_back(gate_bb_ptr);
++        up_bb_ptr = std::aligned_alloc(
++            64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
++        if (!up_bb_ptr) throw std::runtime_error("aligned_alloc failed for up BufferB");
++        owned_aligned_allocs_.push_back(up_bb_ptr);
++        down_bb_ptr = std::aligned_alloc(
++            64, (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~63ULL);
++        if (!down_bb_ptr) throw std::runtime_error("aligned_alloc failed for down BufferB");
++        owned_aligned_allocs_.push_back(down_bb_ptr);
++      }
++      if (use_expert_shm) {
++        gate_bb_.push_back(make_buffer_b_scale_only(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
++        up_bb_.push_back(make_buffer_b_scale_only(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
++        down_bb_.push_back(make_buffer_b_scale_only(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
++      } else {
++        gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
++        up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
++        down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
++      }
+     }
+ 
+     pool_count_ = config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
+@@ -158,6 +257,16 @@ class AVX2_MOE_BASE {
+   virtual ~AVX2_MOE_BASE() {
+     shared_mem_buffer_numa.dealloc(tp_part_idx, this);
+     for (void* p : owned_aligned_allocs_) std::free(p);
++    for (auto& a : expert_arenas_) free_expert_arena(a);
++  }
++
++  // (fd, size, stride) of the gate, up and down arenas; empty unless
++  // KT_EXPERT_SHM=1. Within a block: packed weights first, fp32 group scales
++  // at n * k / 2 (BufferB's layout).
++  std::vector<std::tuple<int, size_t, size_t>> expert_arena_info() const {
++    std::vector<std::tuple<int, size_t, size_t>> out;
++    for (auto& a : expert_arenas_) out.emplace_back(a.fd, a.size, a.stride);
++    return out;
+   }
+ 
+   void warm_up() {
+@@ -191,9 +300,21 @@ class AVX2_MOE_BASE {
+     derived_const()->write_weights_to_buffer(std::forward<Args>(args)...);
+   }
+ 
++  static bool stage_timing_enabled() {
++    static const bool on = getenv("KT_PREFILL_STAGE_TIMING") != nullptr;
++    return on;
++  }
++  static double stage_now_ms() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++  }
++
+   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
+                        void* output) {
+     auto pool = config_.pool->get_subpool(tp_part_idx);
++    const bool st_on = stage_timing_enabled();
++    double st_t[8]; int st_i = 0;
++    auto st_mark = [&]() { if (st_on) st_t[st_i++] = stage_now_ms(); };
++    st_mark();
+ 
+     int activated_expert = 0;
+     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+@@ -270,6 +391,7 @@ class AVX2_MOE_BASE {
+       }
+     };
+ 
++    st_mark();  // 1: routing bookkeeping + buffer carve
+     // Copy input to per-expert buffers
+     direct_or_pool(qlen, [&](int i) {
+       for (int j = 0; j < k; j++) {
+@@ -279,12 +401,14 @@ class AVX2_MOE_BASE {
+       }
+     });
+ 
++    st_mark();  // 2: copy_input
+     // Pack input into BufferA (trivial memcpy for AVX2)
+     direct_or_pool(activated_expert, [this](int task_id) {
+       int expert_idx = m_expert_id_map_[task_id];
+       gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+     });
+ 
++    st_mark();  // 3: pack
+     if constexpr (has_fused_prefill()) {
+       if (activated_expert > 0) run_fused_prefill(activated_expert, qlen);
+     } else {
+@@ -306,8 +430,10 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+ 
++      st_mark();  // 4: gate/up gemm
+       // Activation: SiLU(gate) * up — AVX2 version (8 elements at a time)
+       apply_activation(activated_expert, nth, qlen);
++      st_mark();  // 5: activation
+ 
+       // Pack activation output into BufferA for down projection
+       pool->do_work_stealing_job(
+@@ -318,6 +444,7 @@ class AVX2_MOE_BASE {
+           },
+           nullptr);
+ 
++      st_mark();  // 6: pack down
+       // Down GEMM
+       nth = T::recommended_nth(config_.hidden_size);
+       pool->do_work_stealing_job(
+@@ -331,6 +458,7 @@ class AVX2_MOE_BASE {
+           nullptr);
+     }
+ 
++    st_mark();  // 7: down gemm
+     // Weighted sum of expert outputs — AVX2 version (16 BF16 = 2x8 FP32 at a time)
+     pool->do_work_stealing_job(
+         qlen, nullptr,
+@@ -354,11 +482,22 @@ class AVX2_MOE_BASE {
+           }
+         },
+         nullptr);
++    if (st_on) {
++      st_t[st_i++] = stage_now_ms();
++      // rows per expert: total routed rows on this part / activated experts
++      size_t rows = 0; for (int i = 0; i < config_.expert_num; i++) rows += m_local_num_[i];
++      fprintf(stderr, "[kt-prefill-stage] tp%d layer%d qlen=%d experts=%d rows=%zu | bookkeep %.1f copy %.1f pack %.1f gateup %.1f act %.1f packdown %.1f down %.1f sum %.1f | total %.1f ms\n",
++              tp_part_idx, config_.layer_idx, qlen, activated_expert, rows,
++              st_t[1]-st_t[0], st_t[2]-st_t[1], st_t[3]-st_t[2], st_t[4]-st_t[3], st_t[5]-st_t[4], st_t[6]-st_t[5], st_t[7]-st_t[6], st_t[8]-st_t[7], st_t[8]-st_t[0]);
++    }
+   }
+ 
+   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+     int qlen = 1;
+     auto pool = config_.pool->get_subpool(tp_part_idx);
++    const bool kt_timed = kt_decode_phases::every() > 0;
++    std::chrono::steady_clock::time_point kt_t0, kt_t1, kt_t2, kt_t3;
++    if (kt_timed) kt_t0 = std::chrono::steady_clock::now();
+ 
+     int activated_expert = 0;
+     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
+@@ -427,6 +566,7 @@ class AVX2_MOE_BASE {
+       gate_up_ba_[expert_idx]->from_mat(qlen, (ggml_bf16_t*)input, 0, 1);
+     }
+ 
++    if (kt_timed) kt_t1 = std::chrono::steady_clock::now();
+     // Gate + Up GEMM
+     int nth = T::recommended_nth(config_.intermediate_size);
+     if constexpr (has_fused_gate_up_decode()) {
+@@ -461,6 +601,7 @@ class AVX2_MOE_BASE {
+           nullptr);
+     }
+ 
++    if (kt_timed) kt_t2 = std::chrono::steady_clock::now();
+     // Down GEMM
+     nth = T::recommended_nth(config_.hidden_size);
+     if constexpr (has_fused_down_decode()) {
+@@ -477,6 +618,7 @@ class AVX2_MOE_BASE {
+           nullptr);
+     }
+ 
++    if (kt_timed) kt_t3 = std::chrono::steady_clock::now();
+     // Weighted sum — AVX2 (16 BF16 at a time)
+     for (int e = 0; e < config_.hidden_size; e += 16) {
+       __m256 x0 = _mm256_setzero_ps();
+@@ -494,6 +636,23 @@ class AVX2_MOE_BASE {
+       f32out[0] = x0;
+       f32out[1] = x1;
+     }
++    if (kt_timed) {
++      auto kt_t4 = std::chrono::steady_clock::now();
++      auto& p = kt_decode_phases::part(tp_part_idx);
++      p.t[0] += kt_decode_phases::us(kt_t0, kt_t1);
++      p.t[1] += kt_decode_phases::us(kt_t1, kt_t2);
++      p.t[2] += kt_decode_phases::us(kt_t2, kt_t3);
++      p.t[3] += kt_decode_phases::us(kt_t3, kt_t4);
++      p.experts += activated_expert;
++      if (++p.calls == kt_decode_phases::every()) {
++        std::printf("[kt-decode] part %d, %ld calls: prep %.1f us, gate+up %.1f us, down %.1f us, "
++                    "wsum %.1f us, %.2f experts/call\n",
++                    tp_part_idx, p.calls, p.t[0] / p.calls, p.t[1] / p.calls, p.t[2] / p.calls,
++                    p.t[3] / p.calls, (double)p.experts / p.calls);
++        std::fflush(stdout);
++        p = kt_decode_phases::Part();
++      }
++    }
+   }
+ 
+  protected:
+@@ -537,14 +696,40 @@ class AVX2_MOE_BASE {
+   std::shared_ptr<typename T::BufferB> make_buffer_b(size_t n, size_t k, void* data) const {
+     return derived_const()->make_buffer_b_impl(n, k, data);
+   }
++  // Backends whose BufferB can be scale-only (MXFP4, RawInt4) can keep the
++  // packed weights elsewhere; the KT_EXPERT_SHM arenas rely on that.
++  static constexpr bool kHasScaleOnlyBufferB =
++      requires(const Derived& d) {
++        T::BufferB::required_size_scale_only(size_t{}, size_t{}, int{});
++        d.make_buffer_b_scale_only_impl(size_t{}, size_t{}, (void*)nullptr);
++      };
++  std::shared_ptr<typename T::BufferB> make_buffer_b_scale_only(size_t n, size_t k, void* scales) const {
++    if constexpr (kHasScaleOnlyBufferB) {
++      return derived_const()->make_buffer_b_scale_only_impl(n, k, scales);
++    } else {
++      throw std::runtime_error("KT_EXPERT_SHM needs a backend with scale-only BufferB");
++    }
++  }
++  size_t buffer_b_scale_size(size_t n, size_t k) const {
++    if constexpr (kHasScaleOnlyBufferB) {
++      return T::BufferB::required_size_scale_only(n, k, config_.quant_config.group_size);
++    } else {
++      return 0;
++    }
++  }
+   std::shared_ptr<typename T::BufferC> make_buffer_c(size_t m, size_t n, void* data) const {
+     return derived_const()->make_buffer_c_impl(m, n, data);
+   }
+ 
+-  // SiLU activation — AVX2: process 8 BF16 elements at a time
++  // Routed-expert activation — AVX2: process 8 BF16 elements at a time.
+   void apply_activation(int activated_expert, int nth, int qlen) {
++    ASSERT_RELEASE(
++        config_.activation_type == MOE_ACTIVATION_SILU ||
++            config_.activation_type == MOE_ACTIVATION_GELU_TANH,
++        "Unsupported AVX2 MoE activation_type");
++    const bool use_gelu_tanh = config_.activation_type == MOE_ACTIVATION_GELU_TANH;
+     auto pool = config_.pool->get_subpool(tp_part_idx);
+-    auto fn = [this, nth](int task_id) {
++    auto fn = [this, nth, use_gelu_tanh](int task_id) {
+       int expert_idx = m_expert_id_map_[task_id / nth];
+       int ith = task_id % nth;
+       auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
+@@ -557,14 +742,22 @@ class AVX2_MOE_BASE {
+         for (; j + 8 <= n_end; j += 8) {
+           __m256 gate_val = avx2::load_bf16_to_fp32(gate_ptr + j);
+           __m256 up_val = avx2::load_bf16_to_fp32(up_ptr + j);
+-          __m256 result = avx2::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
++          __m256 result = use_gelu_tanh
++                              ? avx2::gelu_tanh_fn(gate_val, up_val)
++                              : avx2::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
+           avx2::store_fp32_to_bf16(gate_ptr + j, result);
+         }
+-        // Scalar tail — mirror the vectorized swigluoai / silu paths in avx2::act_fn.
++        // Scalar tail — mirror the selected vectorized activation exactly.
+         for (; j < n_end; j++) {
+           float g = GGML_BF16_TO_FP32(gate_ptr[j]);
+           float u = GGML_BF16_TO_FP32(up_ptr[j]);
+-          if (swiglu_alpha > 0.0f) {
++          if (use_gelu_tanh) {
++            constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
++            constexpr float kCubicCoeff = 0.044715f;
++            const float inner = kSqrtTwoOverPi * (g + kCubicCoeff * g * g * g);
++            const float gelu = 0.5f * g * (1.0f + std::tanh(inner));
++            gate_ptr[j] = GGML_FP32_TO_BF16(gelu * u);
++          } else if (swiglu_alpha > 0.0f) {
+             if (swiglu_limit > 0.0f) {
+               g = std::min(std::max(g, -swiglu_limit), swiglu_limit);
+               u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
+diff --git a/kt-kernel/operators/avx2/mxfp4-moe.hpp b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+index e328908..2484298 100644
+--- a/kt-kernel/operators/avx2/mxfp4-moe.hpp
++++ b/kt-kernel/operators/avx2/mxfp4-moe.hpp
+@@ -16,10 +16,37 @@
+ #include <tmmintrin.h>
+ 
+ #include <algorithm>
++#include <atomic>
++#include <memory>
++#include <cmath>
+ #include <cstring>
++#include <mutex>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <string>
+ #include <utility>
++#include <vector>
++#include <cstdlib>
++
++// KT_MXFP4_SCALE_CODES=1: the FP4 decode reads a one-byte scale index per
++// group plus a per-matrix 256-entry FP32 table (patches/kt-mxfp4-scale-codes.py).
++// Read at every load, so one process can load both ways.
++static inline bool kt_mxfp4_scale_codes() {
++  const char* e = std::getenv("KT_MXFP4_SCALE_CODES");
++  return e && e[0] == '1';
++}
++static inline bool kt_scale_codes_verify() {
++  static const bool v = [] { const char* e = std::getenv("KT_MXFP4_SCALE_CODES_VERIFY"); return e && e[0] == '1'; }();
++  return v;
++}
++static std::atomic<size_t> kt_scale_codes_checked{0};
++static std::atomic<size_t> kt_scale_codes_bad_mats{0};
++
++static inline bool kt_scale_codes_load_all() {
++  const char* e = std::getenv("KT_LOAD_ALL_EXPERTS");
++  return e && e[0] == '1';
++}
++
+ 
+ #include "avx2_bf16_gemm.hpp"
+ #include "avx2_bf16_utils.hpp"
+@@ -96,23 +123,110 @@ struct GemmKernelAVX2MXFP4 {
+ 
+   // ---- Buffer types --------------------------------------------------------
+ 
++  // Decode emission order of the 256-bit PSHUFB group decode in gemm_mxfp4:
++  // activations are stored pre-permuted so the inner loops pair weights and
++  // activations with plain loads.
++  static constexpr int kGroupPerm[32] = {0,  2,  4,  6,  1,  3,  5,  7,  8,  10, 12, 14, 9,  11, 13, 15,
++                                         16, 18, 20, 22, 17, 19, 21, 23, 24, 26, 28, 30, 25, 27, 29, 31};
++
+   struct BufferA {
+     ggml_bf16_t* data = nullptr;
++    // Pre-permuted FP32 copy of the same rows (null when k % 32 != 0). Filled
++    // once per expert by from_mat; before 09-13 every gemm_mxfp4 call — one
++    // per 64-row weight slice, 36-80 per expert — redid this conversion for
++    // the whole m x k block, which was ~40% of a prefill task.
++    float* perm = nullptr;
++    // int8 copy for KT_MXFP4_G32_INT8 (patches/kt-mxfp4-g32-int8.py): u8 =
++    // round(a / da) + 128 per row in the decode's lane order, da per row and
++    // per block of 1024 values. Filled by from_mat with perm, shared by the
++    // task's threads.
++    uint8_t* q8 = nullptr;
++    float* da8 = nullptr;
++    int q8_m = 0;
++    static constexpr int kQ8Block = 1024;
++    static bool int8_enabled() {
++      static const bool on = [] {
++        const char* v = std::getenv("KT_MXFP4_G32_INT8");
++        return v ? std::atoi(v) != 0 : false;
++      }();
++      return on;
++    }
++    // Rows the pre-permuted copy holds. Filled by from_mat only for prefill-
++    // sized inputs: writing and reading it for the 1-8 rows of a decode step
++    // cost 13% of Flash-Next decode (09-14, 36.4 -> 31.7 tok/s), while the
++    // gemm's own per-thread scratch stays hot in cache at those sizes.
++    int perm_m = 0;
++    static constexpr int kPermMinRows = 16;
+     size_t max_m = 0, k = 0;
+ 
+     BufferA() = default;
+-    BufferA(size_t m, size_t k_, int /*group_size*/, void* ptr) : data((ggml_bf16_t*)ptr), max_m(m), k(k_) {}
++    BufferA(size_t m, size_t k_, int /*group_size*/, void* ptr) : max_m(m), k(k_) { set_data(ptr); }
+ 
+-    static size_t required_size(size_t m, size_t k, int /*group_size*/) { return m * k * sizeof(ggml_bf16_t); }
+-    void set_data(void* ptr) { data = (ggml_bf16_t*)ptr; }
++    static size_t required_size(size_t m, size_t k, int /*group_size*/) {
++      // bf16 rows + fp32 perm copy + u8 copy + per-block scales
++      return m * k * (sizeof(ggml_bf16_t) + sizeof(float) + 1) + m * (k / kQ8Block + 1) * sizeof(float);
++    }
++    void set_data(void* ptr) {
++      data = (ggml_bf16_t*)ptr;
++      perm = (k % 32 == 0) ? (float*)((uint8_t*)ptr + max_m * k * sizeof(ggml_bf16_t)) : nullptr;
++      q8 = perm ? (uint8_t*)(perm + max_m * k) : nullptr;
++      da8 = q8 ? (float*)(q8 + max_m * k) : nullptr;
++    }
+ 
+     void from_mat(int m, const ggml_bf16_t* src, int ith, int nth) {
+-      if (ith == 0 && nth == 1) {
+-        std::memcpy(data, src, (size_t)m * k * sizeof(ggml_bf16_t));
+-      } else {
+-        auto [m_start, m_end] = split_range(m, ith, nth);
+-        std::memcpy(data + m_start * k, src + m_start * k, (size_t)(m_end - m_start) * k * sizeof(ggml_bf16_t));
++      int m_start = 0, m_end = m;
++      if (!(ith == 0 && nth == 1)) {
++        auto r = split_range(m, ith, nth);
++        m_start = r.first;
++        m_end = r.second;
+       }
++      std::memcpy(data + (size_t)m_start * k, src + (size_t)m_start * k,
++                  (size_t)(m_end - m_start) * k * sizeof(ggml_bf16_t));
++      if (perm == nullptr || m < kPermMinRows) {
++        perm_m = 0;
++        q8_m = 0;
++        return;
++      }
++      perm_m = m;
++      const int groups = (int)(k / 32);
++      for (int mi = m_start; mi < m_end; mi++) {
++        const ggml_bf16_t* a_row = src + (size_t)mi * k;
++        float* p_row = perm + (size_t)mi * k;
++        for (int g = 0; g < groups; g++) {
++          const int base = g * 32;
++          float* dst = p_row + base;
++          for (int j = 0; j < 32; j++) dst[j] = GGML_BF16_TO_FP32(a_row[base + kGroupPerm[j]]);
++        }
++      }
++      q8_m = 0;
++      if (!int8_enabled() || q8 == nullptr || (k % kQ8Block) != 0) return;
++      const int nblk = (int)(k / kQ8Block);
++      for (int mi = m_start; mi < m_end; mi++) {
++        const ggml_bf16_t* a_row = src + (size_t)mi * k;
++        uint8_t* q_row = q8 + (size_t)mi * k;
++        float* d_row = da8 + (size_t)mi * nblk;
++        for (int blk = 0; blk < nblk; blk++) {
++          const ggml_bf16_t* ab = a_row + (size_t)blk * kQ8Block;
++          float amax = 0.f;
++          for (int j = 0; j < kQ8Block; j++) amax = std::max(amax, std::fabs(GGML_BF16_TO_FP32(ab[j])));
++          const float da = amax / 127.f;
++          const float inv = da > 0.f ? 1.f / da : 0.f;
++          d_row[blk] = da;
++          for (int gg = 0; gg < kQ8Block / 32; gg++) {
++            const ggml_bf16_t* sg = ab + gg * 32;
++            uint8_t* dq = q_row + (size_t)blk * kQ8Block + gg * 32;
++            for (int i = 0; i < 16; i++) {
++              int q0 = (int)std::lrintf(GGML_BF16_TO_FP32(sg[2 * i]) * inv);
++              int q1 = (int)std::lrintf(GGML_BF16_TO_FP32(sg[2 * i + 1]) * inv);
++              q0 = q0 > 127 ? 127 : (q0 < -127 ? -127 : q0);
++              q1 = q1 > 127 ? 127 : (q1 < -127 ? -127 : q1);
++              dq[i] = (uint8_t)(q0 + 128);
++              dq[16 + i] = (uint8_t)(q1 + 128);
++            }
++          }
++        }
++      }
++      q8_m = m;
+     }
+   };
+ 
+@@ -148,6 +262,77 @@ struct GemmKernelAVX2MXFP4 {
+       return n * (k / k_group_size) * sizeof(float);
+     }
+ 
++    // One-byte scale codes (KT_MXFP4_SCALE_CODES). lut holds this matrix's
++    // distinct FP32 scales bit for bit; code[i] indexes it for group i.
++    std::unique_ptr<uint8_t[]> code_store;
++    uint8_t* code = nullptr;
++    alignas(64) float lut[256];
++    mutable std::atomic<int> code_checked{0};
++
++    // KT_MXFP4_SCALE_CODES_VERIFY: once per matrix, at first use.
++    void verify_scale_codes() const {
++      int z = 0;
++      if (!code_checked.compare_exchange_strong(z, 1)) return;
++      const size_t cnt = (size_t)n * k_group_count;
++      size_t bad = 0, first = 0;
++      for (size_t i = 0; i < cnt; i++) {
++        uint32_t want, got;
++        std::memcpy(&want, d + i, 4);
++        std::memcpy(&got, lut + code[i], 4);
++        if (want != got) {
++          if (bad == 0) first = i;
++          bad++;
++        }
++      }
++      const size_t c = ++kt_scale_codes_checked;
++      if (bad) {
++        const size_t m = ++kt_scale_codes_bad_mats;
++        uint32_t want, got;
++        std::memcpy(&want, d + first, 4);
++        std::memcpy(&got, lut + code[first], 4);
++        printf("KT_MXFP4_SCALE_CODES_VERIFY: MISMATCH matrix %p n=%d groups=%d: %zu of %zu groups differ, "
++               "first at %zu d=%08x lut=%08x (bad matrices so far %zu)\n",
++               (const void*)this, n, k_group_count, bad, cnt, first, want, got, m);
++        fflush(stdout);
++      }
++      if (c % 20000 == 0) {
++        printf("KT_MXFP4_SCALE_CODES_VERIFY: %zu matrices checked, %zu with mismatches\n", c,
++               kt_scale_codes_bad_mats.load());
++        fflush(stdout);
++      }
++    }
++
++    // Returns false (and leaves the FP32 path in place) if the matrix has more
++    // than 256 distinct scale bit patterns.
++    bool build_scale_codes() {
++      code = nullptr;
++      if (d == nullptr || n <= 0 || k_group_count <= 0) return false;
++      const size_t cnt = (size_t)n * k_group_count;
++      std::unique_ptr<uint8_t[]> out(new uint8_t[cnt]);
++      uint32_t keys[512];
++      int16_t val[512];
++      for (int i = 0; i < 512; i++) val[i] = -1;
++      int nd = 0;
++      for (size_t i = 0; i < cnt; i++) {
++        uint32_t x;
++        std::memcpy(&x, d + i, 4);
++        uint32_t h = (x * 2654435761u) >> 23;
++        while (val[h] >= 0 && keys[h] != x) h = (h + 1) & 511;
++        if (val[h] < 0) {
++          if (nd == 256) return false;
++          keys[h] = x;
++          val[h] = (int16_t)nd;
++          std::memcpy(&lut[nd], &x, 4);
++          nd++;
++        }
++        out[i] = (uint8_t)val[h];
++      }
++      for (int i = nd; i < 256; i++) lut[i] = 0.0f;
++      code_store = std::move(out);
++      code = code_store.get();
++      return true;
++    }
++
+     void from_raw_mat(const uint8_t* proj, int ith, int nth) {
+       if (b == nullptr) return;
+       auto [n_start, n_end] = split_range(n, ith, nth);
+@@ -185,6 +370,15 @@ struct GemmKernelAVX2MXFP4 {
+ // N-outer loop: each weight row loaded once and shared across M tokens.
+ // 4-token M-blocking for prefill: weight decode amortized over 4 activations.
+ // ============================================================================
++static inline int32_t hsum_i32(__m256i v) {
++  __m128i lo = _mm256_castsi256_si128(v);
++  __m128i hi = _mm256_extracti128_si256(v, 1);
++  lo = _mm_add_epi32(lo, hi);
++  lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0x4E));
++  lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, 0xB1));
++  return _mm_cvtsi128_si32(lo);
++}
++
+ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, GemmKernelAVX2MXFP4::BufferB& b,
+                        GemmKernelAVX2MXFP4::BufferC& c, int ith, int nth) {
+   // H3: Check weight buffer is not null
+@@ -199,6 +393,759 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
+   const __m128i lut_lo = _mm_load_si128((const __m128i*)GemmKernelAVX2MXFP4::fp4_bf16_lo);
+   const __m128i lut_hi = _mm_load_si128((const __m128i*)GemmKernelAVX2MXFP4::fp4_bf16_hi);
+ 
++  // --------------------------------------------------------------------------
++  // Fast path (decode AND prefill): one whole 32-value k-group is decoded per
++  // iteration with 256-bit PSHUFB.  The decode naturally emits values in a
++  // fixed in-lane permutation; rather than reordering the weights (extra
++  // shuffle uops on Zen2's two shuffle pipes, which is exactly what limits
++  // the generic path), every activation row is converted to FP32 once in that
++  // same permuted order, so the inner loops pair weights and activations with
++  // plain loads and FMAs.  unpack(zero, u16) fuses the BF16→FP32 widen and
++  // <<16 into a single shuffle.  Tokens are processed in blocks of 4 so each
++  // decoded group is amortized over 4 accumulators (16 ymm live: 4 weights +
++  // 4 group accumulators + 4 totals + LUTs); the remainder uses the
++  // single-row loop.  Very large per-expert batches fall back to the generic
++  // path to bound the per-thread FP32 staging buffer.
++  // --------------------------------------------------------------------------
++  if (group_size == 32 && (k % 32) == 0 && (a.perm != nullptr || (size_t)m * (size_t)k <= (size_t)(4 << 20))) {
++    // Decode emission order within each 32-value group (see w0..w3 below).
++    const int* kPerm = GemmKernelAVX2MXFP4::kGroupPerm;
++    static thread_local std::vector<float> a_perm_storage;
++    const float* a_perm = (a.perm != nullptr && a.perm_m >= m) ? a.perm : nullptr;
++    if (a_perm == nullptr) {
++      if (a_perm_storage.size() < (size_t)m * k) a_perm_storage.resize((size_t)m * k);
++      float* tmp = a_perm_storage.data();
++      for (int mi = 0; mi < m; mi++) {
++        const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
++        float* p_row = tmp + (size_t)mi * k;
++        for (int g = 0; g < group_count; g++) {
++          const int base = g * 32;
++          float* dst = p_row + base;
++          for (int j = 0; j < 32; j++) dst[j] = GGML_BF16_TO_FP32(a_row[base + kPerm[j]]);
++        }
++      }
++      a_perm = tmp;
++    }
++
++    const __m256i lut_lo256 = _mm256_broadcastsi128_si256(lut_lo);
++    const __m256i lut_hi256 = _mm256_broadcastsi128_si256(lut_hi);
++    const __m256i zero256 = _mm256_setzero_si256();
++    const __m128i nib_mask = _mm_set1_epi8(0x0F);
++    const __m256i nib_mask256 = _mm256_set1_epi8(0x0F);
++    const __m256i lane_shift = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);
++
++// Decode one 32-value k-group at b_row+g*16 into w0..w3:
++// w0: cols {0,2,4,6 | 1,3,5,7};  w1: {8,10,12,14 | 9,11,13,15}
++// w2: {16,...,22 | 17,...,23};   w3: {24,...,30 | 25,...,31}
++#define KT_MXFP4_DECODE_GROUP(b_row, g)                                            \
++  const __m256i r2 = _mm256_broadcastsi128_si256(                                 \
++      _mm_loadu_si128((const __m128i*)((b_row) + (size_t)(g)*16)));                 \
++  const __m256i v = _mm256_and_si256(_mm256_srlv_epi32(r2, lane_shift), nib_mask256); \
++  const __m256i bl = _mm256_shuffle_epi8(lut_lo256, v);                            \
++  const __m256i bh = _mm256_shuffle_epi8(lut_hi256, v);                            \
++  const __m256i u16a = _mm256_unpacklo_epi8(bl, bh);                               \
++  const __m256i u16b = _mm256_unpackhi_epi8(bl, bh);                               \
++  const __m256 w0 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16a));     \
++  const __m256 w1 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16a));     \
++  const __m256 w2 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16b));     \
++  const __m256 w3 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16b))
++
++    // Rows outer, output columns inner (group-32). The four activation rows
++    // (64 KiB at k = 4096) stay in L1 across every output column of this
++    // thread instead of being re-streamed from L2 once per column; the
++    // weights stream instead. Each output keeps its own untouched k loop and
++    // is written exactly once, so the result is bit-identical.
++#define KT_MXFP4_PREFETCH_NEXT_ROW(ni)                                         \
++  if ((ni) + 1 < n_end) {                                                      \
++    const char* nr = (const char*)(b.b + (size_t)((ni) + 1) * row_bytes);      \
++    _mm_prefetch(nr, _MM_HINT_T0);                                             \
++    _mm_prefetch(nr + 64, _MM_HINT_T0);                                        \
++    _mm_prefetch(nr + 128, _MM_HINT_T0);                                       \
++    _mm_prefetch(nr + 192, _MM_HINT_T0);                                       \
++  }
++    // Row decode per token tile (group-32). With a tile of TILE >= 8 rows,
++    // each output column's weight row is decoded once into an L1 buffer and
++    // read back by every 4-token block of the tile; the products, per-group
++    // accumulation and scale fold per output are the same as below, so the
++    // result is bit-identical.
++    static const int kTile = [] {
++      const char* v = std::getenv("KT_MXFP4_G32_TILE");
++      return v ? std::max(0, std::atoi(v)) & ~3 : 0;
++    }();
++    // int8 path v2 (group-32, KT_MXFP4_G32_INT8). See patches/kt-mxfp4-g32-int8.py.
++    int mi8 = 0;
++    if (GemmKernelAVX2MXFP4::BufferA::int8_enabled() && a.q8 != nullptr && a.q8_m >= m && m >= 4 &&
++        n_end > n_start && group_count % 32 == 0) {
++      const int ncols = n_end - n_start;
++      const int nblk = group_count / 32;
++      const uint8_t* aq = a.q8;
++      const float* da = a.da8;
++      static thread_local std::vector<int16_t> shmul_s;
++      static thread_local std::vector<float> pow2_s, corr_s, outp_s;
++      if (shmul_s.size() < (size_t)ncols * group_count) shmul_s.resize((size_t)ncols * group_count);
++      if (pow2_s.size() < (size_t)ncols * nblk) pow2_s.resize((size_t)ncols * nblk);
++      if (corr_s.size() < (size_t)ncols * nblk) corr_s.resize((size_t)ncols * nblk);
++      if (outp_s.size() < (size_t)ncols * 4) outp_s.resize((size_t)ncols * 4);
++      int16_t* shmul = shmul_s.data();
++      float* pow2 = pow2_s.data();
++      float* corr = corr_s.data();
++      float* outp = outp_s.data();
++      alignas(32) static const int8_t kLutI8[32] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
++                                                    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
++      const __m256i lut_i8 = _mm256_load_si256((const __m256i*)kLutI8);
++      const __m256i nib_mask256 = _mm256_set1_epi8(0x0F);
++      const __m256i lane_shift = _mm256_setr_epi32(0, 0, 0, 0, 4, 4, 4, 4);
++      const __m256i ones_u8 = _mm256_set1_epi8(1);
++      const __m256i ones_i16 = _mm256_set1_epi16(1);
++      // --- per-column tables from the scale bits (scales are exact powers of two)
++      bool ok = true;
++      for (int ni = n_start; ni < n_end && ok; ni++) {
++        const float* sc = b.d + (size_t)ni * group_count;
++        const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++        int16_t* shm = shmul + (size_t)(ni - n_start) * group_count;
++        for (int blk = 0; blk < nblk; blk++) {
++          int emin = 1000, emax = -1000;
++          for (int g = blk * 32; g < blk * 32 + 32; g++) {
++            uint32_t bits;
++            std::memcpy(&bits, &sc[g], 4);
++            const int e = (int)((bits >> 23) & 0xFF) - 127;  // sc = 2^e exactly
++            emin = e < emin ? e : emin;
++            emax = e > emax ? e : emax;
++          }
++          if (emax - emin > 12) { ok = false; break; }
++          pow2[(size_t)(ni - n_start) * nblk + blk] = std::ldexp(0.5f, emin);
++          int32_t csum = 0;
++          for (int g = blk * 32; g < blk * 32 + 32; g++) {
++            uint32_t bits;
++            std::memcpy(&bits, &sc[g], 4);
++            const int sh = (int)((bits >> 23) & 0xFF) - 127 - emin;
++            shm[g] = (int16_t)(1 << sh);
++            const __m256i r2 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)(b_row + (size_t)g * 16)));
++            const __m256i v = _mm256_and_si256(_mm256_srlv_epi32(r2, lane_shift), nib_mask256);
++            const __m256i w8 = _mm256_shuffle_epi8(lut_i8, v);
++            const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_u8, w8), ones_i16);
++            csum += hsum_i32(p32) << sh;
++          }
++          corr[(size_t)(ni - n_start) * nblk + blk] = 128.f * (float)csum;
++        }
++      }
++      if (ok) {
++        for (; mi8 + 4 <= m; mi8 += 4) {
++          std::fill(outp, outp + (size_t)ncols * 4, 0.f);
++          const uint8_t* q0 = aq + (size_t)(mi8 + 0) * k;
++          const uint8_t* q1 = aq + (size_t)(mi8 + 1) * k;
++          const uint8_t* q2 = aq + (size_t)(mi8 + 2) * k;
++          const uint8_t* q3 = aq + (size_t)(mi8 + 3) * k;
++          for (int blk = 0; blk < nblk; blk++) {
++            const int g0 = blk * 32, g1 = g0 + 32;
++            const float d0 = da[(size_t)(mi8 + 0) * nblk + blk], d1 = da[(size_t)(mi8 + 1) * nblk + blk];
++            const float d2 = da[(size_t)(mi8 + 2) * nblk + blk], d3 = da[(size_t)(mi8 + 3) * nblk + blk];
++            for (int ni = n_start; ni < n_end; ni++) {
++              const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++              const int16_t* shm = shmul + (size_t)(ni - n_start) * group_count;
++              __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
++              __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
++              for (int g = g0; g < g1; g++) {
++                const __m256i r2 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)(b_row + (size_t)g * 16)));
++                const __m256i v = _mm256_and_si256(_mm256_srlv_epi32(r2, lane_shift), nib_mask256);
++                const __m256i w8 = _mm256_shuffle_epi8(lut_i8, v);
++                const __m256i mul = _mm256_set1_epi16(shm[g]);
++                const size_t off = (size_t)g * 32;
++                acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*)(q0 + off)), w8), mul));
++                acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*)(q1 + off)), w8), mul));
++                acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*)(q2 + off)), w8), mul));
++                acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*)(q3 + off)), w8), mul));
++              }
++              const float cc = corr[(size_t)(ni - n_start) * nblk + blk];
++              const float p2 = pow2[(size_t)(ni - n_start) * nblk + blk];
++              float* o = outp + (size_t)(ni - n_start) * 4;
++              o[0] += ((float)hsum_i32(acc0) - cc) * d0 * p2;
++              o[1] += ((float)hsum_i32(acc1) - cc) * d1 * p2;
++              o[2] += ((float)hsum_i32(acc2) - cc) * d2 * p2;
++              o[3] += ((float)hsum_i32(acc3) - cc) * d3 * p2;
++            }
++          }
++          for (int ni = n_start; ni < n_end; ni++) {
++            const float* o = outp + (size_t)(ni - n_start) * 4;
++            c.data[(size_t)(mi8 + 0) * n + ni] = o[0];
++            c.data[(size_t)(mi8 + 1) * n + ni] = o[1];
++            c.data[(size_t)(mi8 + 2) * n + ni] = o[2];
++            c.data[(size_t)(mi8 + 3) * n + ni] = o[3];
++          }
++        }
++      }
++    }
++    // k-blocked (group-32). A 4-token block's activations for kBlk groups
++    // (16 KiB at 32 groups) stay in L1 while this thread's columns go by; each
++    // column's 8-lane running sums are parked between k blocks. Exact parking,
++    // groups summed in order: bit-identical.
++    static const int kBlk = [] {
++      const char* v = std::getenv("KT_MXFP4_G32_KBLK");
++      return v ? std::max(0, std::atoi(v)) : 32;
++    }();
++    int mi = mi8;
++    if (kBlk > 0 && kBlk < group_count && n_end > n_start) {
++      const int ncols = n_end - n_start;
++      static thread_local std::vector<float> park_storage;
++      if (park_storage.size() < (size_t)ncols * 8 * 8) park_storage.resize((size_t)ncols * 8 * 8);
++      float* park = park_storage.data();
++      // 8-token blocks (group-32). Eight independent group chains per decoded
++      // group; the running sums are loaded from and stored to the park buffer
++      // around each group's fold (exact), so registers hold only the chains.
++      static const bool kT8 = [] {
++        const char* v = std::getenv("KT_MXFP4_G32_T8");
++        return v ? std::atoi(v) != 0 : false;
++      }();
++      static thread_local std::vector<float> ibuf_storage;
++      if (kT8 && ibuf_storage.size() < (size_t)8 * k) ibuf_storage.resize((size_t)8 * k);
++      for (; kT8 && mi + 8 <= m; mi += 8) {
++        // The block's eight rows, group-interleaved: group g of token t at
++        // ibuf[(g * 8 + t) * 32]. One pointer and constant offsets in the hot
++        // loop instead of eight row pointers (which spilled to the stack).
++        float* ibuf = ibuf_storage.data();
++        for (int g = 0; g < group_count; g++)
++          for (int t = 0; t < 8; t++)
++            std::memcpy(ibuf + ((size_t)g * 8 + t) * 32, a_perm + (size_t)(mi + t) * k + (size_t)g * 32,
++                        32 * sizeof(float));
++        std::fill(park, park + (size_t)ncols * 8 * 8, 0.f);
++        for (int gb = 0; gb < group_count; gb += kBlk) {
++          const int ge = std::min(group_count, gb + kBlk);
++          for (int ni = n_start; ni < n_end; ni++) {
++            const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++            const float* b_scales = b.d + (size_t)ni * group_count;
++            float* pk = park + (size_t)(ni - n_start) * 64;
++            for (int g = gb; g < ge; g++) {
++              KT_MXFP4_DECODE_GROUP(b_row, g);
++              const float* a0 = ibuf + (size_t)g * 256;
++              const float* a1 = a0 + 32; const float* a2 = a0 + 64; const float* a3 = a0 + 96;
++              const float* a4 = a0 + 128; const float* a5 = a0 + 160; const float* a6 = a0 + 192;
++              const float* a7 = a0 + 224;
++              __m256 g0 = _mm256_mul_ps(_mm256_loadu_ps(a0), w0);
++              __m256 g1 = _mm256_mul_ps(_mm256_loadu_ps(a1), w0);
++              __m256 g2 = _mm256_mul_ps(_mm256_loadu_ps(a2), w0);
++              __m256 g3 = _mm256_mul_ps(_mm256_loadu_ps(a3), w0);
++              __m256 g4 = _mm256_mul_ps(_mm256_loadu_ps(a4), w0);
++              __m256 g5 = _mm256_mul_ps(_mm256_loadu_ps(a5), w0);
++              __m256 g6 = _mm256_mul_ps(_mm256_loadu_ps(a6), w0);
++              __m256 g7 = _mm256_mul_ps(_mm256_loadu_ps(a7), w0);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(a0 + 8), w1, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(a1 + 8), w1, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(a2 + 8), w1, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(a3 + 8), w1, g3);
++              g4 = _mm256_fmadd_ps(_mm256_loadu_ps(a4 + 8), w1, g4);
++              g5 = _mm256_fmadd_ps(_mm256_loadu_ps(a5 + 8), w1, g5);
++              g6 = _mm256_fmadd_ps(_mm256_loadu_ps(a6 + 8), w1, g6);
++              g7 = _mm256_fmadd_ps(_mm256_loadu_ps(a7 + 8), w1, g7);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(a0 + 16), w2, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(a1 + 16), w2, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(a2 + 16), w2, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(a3 + 16), w2, g3);
++              g4 = _mm256_fmadd_ps(_mm256_loadu_ps(a4 + 16), w2, g4);
++              g5 = _mm256_fmadd_ps(_mm256_loadu_ps(a5 + 16), w2, g5);
++              g6 = _mm256_fmadd_ps(_mm256_loadu_ps(a6 + 16), w2, g6);
++              g7 = _mm256_fmadd_ps(_mm256_loadu_ps(a7 + 16), w2, g7);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(a0 + 24), w3, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(a1 + 24), w3, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(a2 + 24), w3, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(a3 + 24), w3, g3);
++              g4 = _mm256_fmadd_ps(_mm256_loadu_ps(a4 + 24), w3, g4);
++              g5 = _mm256_fmadd_ps(_mm256_loadu_ps(a5 + 24), w3, g5);
++              g6 = _mm256_fmadd_ps(_mm256_loadu_ps(a6 + 24), w3, g6);
++              g7 = _mm256_fmadd_ps(_mm256_loadu_ps(a7 + 24), w3, g7);
++              const __m256 sv = _mm256_broadcast_ss(&b_scales[g]);
++              _mm256_storeu_ps(pk + 0, _mm256_fmadd_ps(g0, sv, _mm256_loadu_ps(pk + 0)));
++              _mm256_storeu_ps(pk + 8, _mm256_fmadd_ps(g1, sv, _mm256_loadu_ps(pk + 8)));
++              _mm256_storeu_ps(pk + 16, _mm256_fmadd_ps(g2, sv, _mm256_loadu_ps(pk + 16)));
++              _mm256_storeu_ps(pk + 24, _mm256_fmadd_ps(g3, sv, _mm256_loadu_ps(pk + 24)));
++              _mm256_storeu_ps(pk + 32, _mm256_fmadd_ps(g4, sv, _mm256_loadu_ps(pk + 32)));
++              _mm256_storeu_ps(pk + 40, _mm256_fmadd_ps(g5, sv, _mm256_loadu_ps(pk + 40)));
++              _mm256_storeu_ps(pk + 48, _mm256_fmadd_ps(g6, sv, _mm256_loadu_ps(pk + 48)));
++              _mm256_storeu_ps(pk + 56, _mm256_fmadd_ps(g7, sv, _mm256_loadu_ps(pk + 56)));
++            }
++          }
++        }
++        for (int ni = n_start; ni < n_end; ni++) {
++          const float* pk = park + (size_t)(ni - n_start) * 64;
++          for (int t = 0; t < 8; t++)
++            c.data[(size_t)(mi + t) * n + ni] = hsum_avx2(_mm256_loadu_ps(pk + 8 * t));
++        }
++      }
++      // Short chains (group-32, KT_MXFP4_G32_FAST). Scale folded into the
++      // weights once per group, two running sums per token: each chain grows by
++      // two FMAs per group instead of five. Not bit-identical (rounding order).
++      static const bool kFast = [] {
++        const char* v = std::getenv("KT_MXFP4_G32_FAST");
++        return v ? std::atoi(v) != 0 : false;
++      }();
++      if (kFast && park_storage.size() < (size_t)ncols * 8 * 8) {
++        park_storage.resize((size_t)ncols * 8 * 8);
++        park = park_storage.data();
++      }
++      for (; kFast && mi + 4 <= m; mi += 4) {
++        const float* p0 = a_perm + (size_t)(mi + 0) * k;
++        const float* p1 = a_perm + (size_t)(mi + 1) * k;
++        const float* p2 = a_perm + (size_t)(mi + 2) * k;
++        const float* p3 = a_perm + (size_t)(mi + 3) * k;
++        std::fill(park, park + (size_t)ncols * 8 * 8, 0.f);
++        for (int gb = 0; gb < group_count; gb += kBlk) {
++          const int ge = std::min(group_count, gb + kBlk);
++          for (int ni = n_start; ni < n_end; ni++) {
++            const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++            const float* b_scales = b.d + (size_t)ni * group_count;
++            float* pk = park + (size_t)(ni - n_start) * 64;
++            __m256 A0 = _mm256_loadu_ps(pk + 0), B0 = _mm256_loadu_ps(pk + 8);
++            __m256 A1 = _mm256_loadu_ps(pk + 16), B1 = _mm256_loadu_ps(pk + 24);
++            __m256 A2 = _mm256_loadu_ps(pk + 32), B2 = _mm256_loadu_ps(pk + 40);
++            __m256 A3 = _mm256_loadu_ps(pk + 48), B3 = _mm256_loadu_ps(pk + 56);
++            for (int g = gb; g < ge; g++) {
++              const int base = g * 32;
++              KT_MXFP4_DECODE_GROUP(b_row, g);
++              const __m256 sv = _mm256_broadcast_ss(&b_scales[g]);
++              const __m256 s0 = _mm256_mul_ps(w0, sv);
++              const __m256 s1 = _mm256_mul_ps(w1, sv);
++              const __m256 s2 = _mm256_mul_ps(w2, sv);
++              const __m256 s3 = _mm256_mul_ps(w3, sv);
++              A0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base), s0, A0);
++              A1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base), s0, A1);
++              A2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base), s0, A2);
++              A3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base), s0, A3);
++              B0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), s1, B0);
++              B1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), s1, B1);
++              B2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), s1, B2);
++              B3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), s1, B3);
++              A0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 16), s2, A0);
++              A1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 16), s2, A1);
++              A2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 16), s2, A2);
++              A3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 16), s2, A3);
++              B0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), s3, B0);
++              B1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), s3, B1);
++              B2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), s3, B2);
++              B3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), s3, B3);
++            }
++            _mm256_storeu_ps(pk + 0, A0); _mm256_storeu_ps(pk + 8, B0);
++            _mm256_storeu_ps(pk + 16, A1); _mm256_storeu_ps(pk + 24, B1);
++            _mm256_storeu_ps(pk + 32, A2); _mm256_storeu_ps(pk + 40, B2);
++            _mm256_storeu_ps(pk + 48, A3); _mm256_storeu_ps(pk + 56, B3);
++          }
++        }
++        for (int ni = n_start; ni < n_end; ni++) {
++          const float* pk = park + (size_t)(ni - n_start) * 64;
++          for (int t = 0; t < 4; t++)
++            c.data[(size_t)(mi + t) * n + ni] =
++                hsum_avx2(_mm256_add_ps(_mm256_loadu_ps(pk + 16 * t), _mm256_loadu_ps(pk + 16 * t + 8)));
++        }
++      }
++      for (; mi + 4 <= m; mi += 4) {
++        const float* p0 = a_perm + (size_t)(mi + 0) * k;
++        const float* p1 = a_perm + (size_t)(mi + 1) * k;
++        const float* p2 = a_perm + (size_t)(mi + 2) * k;
++        const float* p3 = a_perm + (size_t)(mi + 3) * k;
++        std::fill(park, park + (size_t)ncols * 4 * 8, 0.f);
++        for (int gb = 0; gb < group_count; gb += kBlk) {
++          const int ge = std::min(group_count, gb + kBlk);
++          for (int ni = n_start; ni < n_end; ni++) {
++            const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++            const float* b_scales = b.d + (size_t)ni * group_count;
++            float* pk = park + (size_t)(ni - n_start) * 32;
++            __m256 tot0 = _mm256_loadu_ps(pk), tot1 = _mm256_loadu_ps(pk + 8);
++            __m256 tot2 = _mm256_loadu_ps(pk + 16), tot3 = _mm256_loadu_ps(pk + 24);
++            for (int g = gb; g < ge; g++) {
++              const int base = g * 32;
++              KT_MXFP4_DECODE_GROUP(b_row, g);
++              __m256 g0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0);
++              __m256 g1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base), w0);
++              __m256 g2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base), w0);
++              __m256 g3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base), w0);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), w1, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), w1, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), w1, g3);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 16), w2, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 16), w2, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 16), w2, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 16), w2, g3);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), w3, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), w3, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), w3, g3);
++              const __m256 sv = _mm256_broadcast_ss(&b_scales[g]);
++              tot0 = _mm256_fmadd_ps(g0, sv, tot0);
++              tot1 = _mm256_fmadd_ps(g1, sv, tot1);
++              tot2 = _mm256_fmadd_ps(g2, sv, tot2);
++              tot3 = _mm256_fmadd_ps(g3, sv, tot3);
++            }
++            _mm256_storeu_ps(pk, tot0);
++            _mm256_storeu_ps(pk + 8, tot1);
++            _mm256_storeu_ps(pk + 16, tot2);
++            _mm256_storeu_ps(pk + 24, tot3);
++          }
++        }
++        for (int ni = n_start; ni < n_end; ni++) {
++          const float* pk = park + (size_t)(ni - n_start) * 32;
++          c.data[(size_t)(mi + 0) * n + ni] = hsum_avx2(_mm256_loadu_ps(pk));
++          c.data[(size_t)(mi + 1) * n + ni] = hsum_avx2(_mm256_loadu_ps(pk + 8));
++          c.data[(size_t)(mi + 2) * n + ni] = hsum_avx2(_mm256_loadu_ps(pk + 16));
++          c.data[(size_t)(mi + 3) * n + ni] = hsum_avx2(_mm256_loadu_ps(pk + 24));
++        }
++      }
++      // 0-3 remaining rows fall through to the single-row loop below, which
++      // is unchanged (its per-parity accumulators already match).
++    }
++    if (kTile >= 8 && m >= 8 && mi == 0 && mi8 == 0) {
++      static thread_local std::vector<float> wrow_storage;
++      if (wrow_storage.size() < (size_t)k) wrow_storage.resize((size_t)k);
++      float* wrow = wrow_storage.data();
++      for (int t0 = 0; t0 < m; t0 += kTile) {
++        const int t1 = std::min(m, t0 + kTile);
++        const int t1_4 = t0 + ((t1 - t0) & ~3);
++        for (int ni = n_start; ni < n_end; ni++) {
++          const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++          const float* b_scales = b.d + (size_t)ni * group_count;
++          KT_MXFP4_PREFETCH_NEXT_ROW(ni)
++          for (int g = 0; g < group_count; g++) {
++            KT_MXFP4_DECODE_GROUP(b_row, g);
++            float* wg = wrow + (size_t)g * 32;
++            _mm256_storeu_ps(wg, w0);
++            _mm256_storeu_ps(wg + 8, w1);
++            _mm256_storeu_ps(wg + 16, w2);
++            _mm256_storeu_ps(wg + 24, w3);
++          }
++          for (int bi = t0; bi < t1_4; bi += 4) {
++            const float* p0 = a_perm + (size_t)(bi + 0) * k;
++            const float* p1 = a_perm + (size_t)(bi + 1) * k;
++            const float* p2 = a_perm + (size_t)(bi + 2) * k;
++            const float* p3 = a_perm + (size_t)(bi + 3) * k;
++            __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
++            __m256 tot2 = _mm256_setzero_ps(), tot3 = _mm256_setzero_ps();
++            for (int g = 0; g < group_count; g++) {
++              const int base = g * 32;
++              const float* wg = wrow + base;
++              const __m256 w0 = _mm256_loadu_ps(wg);
++              const __m256 w1 = _mm256_loadu_ps(wg + 8);
++              const __m256 w2 = _mm256_loadu_ps(wg + 16);
++              const __m256 w3 = _mm256_loadu_ps(wg + 24);
++              __m256 g0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0);
++              __m256 g1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base), w0);
++              __m256 g2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base), w0);
++              __m256 g3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base), w0);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), w1, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), w1, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), w1, g3);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 16), w2, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 16), w2, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 16), w2, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 16), w2, g3);
++              g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3, g0);
++              g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), w3, g1);
++              g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), w3, g2);
++              g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), w3, g3);
++              const __m256 sv = _mm256_broadcast_ss(&b_scales[g]);
++              tot0 = _mm256_fmadd_ps(g0, sv, tot0);
++              tot1 = _mm256_fmadd_ps(g1, sv, tot1);
++              tot2 = _mm256_fmadd_ps(g2, sv, tot2);
++              tot3 = _mm256_fmadd_ps(g3, sv, tot3);
++            }
++            c.data[(size_t)(bi + 0) * n + ni] = hsum_avx2(tot0);
++            c.data[(size_t)(bi + 1) * n + ni] = hsum_avx2(tot1);
++            c.data[(size_t)(bi + 2) * n + ni] = hsum_avx2(tot2);
++            c.data[(size_t)(bi + 3) * n + ni] = hsum_avx2(tot3);
++          }
++          // the tile's last 0-3 rows: the single-row arithmetic, weights from L1
++          for (int ri = t1_4; ri < t1; ri++) {
++            const float* ap_row = a_perm + (size_t)ri * k;
++            __m256 total0 = _mm256_setzero_ps();
++            __m256 total1 = _mm256_setzero_ps();
++            for (int g = 0; g < group_count; g++) {
++              const float* ap = ap_row + g * 32;
++              const float* wg = wrow + (size_t)g * 32;
++              __m256 gacc = _mm256_mul_ps(_mm256_loadu_ps(ap), _mm256_loadu_ps(wg));
++              gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), _mm256_loadu_ps(wg + 8), gacc);
++              gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 16), _mm256_loadu_ps(wg + 16), gacc);
++              gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), _mm256_loadu_ps(wg + 24), gacc);
++              const __m256 sv = _mm256_broadcast_ss(&b_scales[g]);
++              if (g & 1)
++                total1 = _mm256_fmadd_ps(gacc, sv, total1);
++              else
++                total0 = _mm256_fmadd_ps(gacc, sv, total0);
++            }
++            c.data[(size_t)ri * n + ni] = hsum_avx2(_mm256_add_ps(total0, total1));
++          }
++        }
++      }
++      mi = m;  // every row done; the loops below are skipped
++    }
++    for (; mi + 4 <= m; mi += 4) {
++      const float* p0 = a_perm + (size_t)(mi + 0) * k;
++      const float* p1 = a_perm + (size_t)(mi + 1) * k;
++      const float* p2 = a_perm + (size_t)(mi + 2) * k;
++      const float* p3 = a_perm + (size_t)(mi + 3) * k;
++      for (int ni = n_start; ni < n_end; ni++) {
++        const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++        const float* b_scales = b.d + (size_t)ni * group_count;
++        KT_MXFP4_PREFETCH_NEXT_ROW(ni)
++        __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
++        __m256 tot2 = _mm256_setzero_ps(), tot3 = _mm256_setzero_ps();
++
++        for (int g = 0; g < group_count; g++) {
++          const int base = g * 32;
++          KT_MXFP4_DECODE_GROUP(b_row, g);
++
++          __m256 g0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0);
++          __m256 g1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base), w0);
++          __m256 g2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base), w0);
++          __m256 g3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base), w0);
++          g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1, g0);
++          g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), w1, g1);
++          g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), w1, g2);
++          g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), w1, g3);
++          g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 16), w2, g0);
++          g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 16), w2, g1);
++          g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 16), w2, g2);
++          g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 16), w2, g3);
++          g0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3, g0);
++          g1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), w3, g1);
++          g2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), w3, g2);
++          g3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), w3, g3);
++
++          const __m256 sv = _mm256_broadcast_ss(&b_scales[g]);
++          tot0 = _mm256_fmadd_ps(g0, sv, tot0);
++          tot1 = _mm256_fmadd_ps(g1, sv, tot1);
++          tot2 = _mm256_fmadd_ps(g2, sv, tot2);
++          tot3 = _mm256_fmadd_ps(g3, sv, tot3);
++        }
++        c.data[(size_t)(mi + 0) * n + ni] = hsum_avx2(tot0);
++        c.data[(size_t)(mi + 1) * n + ni] = hsum_avx2(tot1);
++        c.data[(size_t)(mi + 2) * n + ni] = hsum_avx2(tot2);
++        c.data[(size_t)(mi + 3) * n + ni] = hsum_avx2(tot3);
++      }
++    }
++
++    // Single-row remainder (also the whole decode path when m == 1).
++    for (; mi < m; mi++) {
++      const float* ap_row = a_perm + (size_t)mi * k;
++      for (int ni = n_start; ni < n_end; ni++) {
++        const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++        const float* b_scales = b.d + (size_t)ni * group_count;
++        KT_MXFP4_PREFETCH_NEXT_ROW(ni)
++        __m256 total0 = _mm256_setzero_ps();
++        __m256 total1 = _mm256_setzero_ps();
++        if (b.code != nullptr) {
++          if (kt_scale_codes_verify()) b.verify_scale_codes();
++          // Same loop; the scale comes from the matrix's table by index.
++          const uint8_t* b_codes = b.code + (size_t)ni * group_count;
++          const float* lut = b.lut;
++          for (int g = 0; g < group_count; g++) {
++            const float* ap = ap_row + g * 32;
++            KT_MXFP4_DECODE_GROUP(b_row, g);
++
++            __m256 gacc = _mm256_mul_ps(_mm256_loadu_ps(ap), w0);
++            gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), w1, gacc);
++            gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 16), w2, gacc);
++            gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), w3, gacc);
++
++            const __m256 sv = _mm256_broadcast_ss(&lut[b_codes[g]]);
++            if (g & 1)
++              total1 = _mm256_fmadd_ps(gacc, sv, total1);
++            else
++              total0 = _mm256_fmadd_ps(gacc, sv, total0);
++          }
++        } else
++        for (int g = 0; g < group_count; g++) {
++          const float* ap = ap_row + g * 32;
++          KT_MXFP4_DECODE_GROUP(b_row, g);
++
++          __m256 gacc = _mm256_mul_ps(_mm256_loadu_ps(ap), w0);
++          gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), w1, gacc);
++          gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 16), w2, gacc);
++          gacc = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), w3, gacc);
++
++          const __m256 sv = _mm256_broadcast_ss(&b_scales[g]);
++          if (g & 1)
++            total1 = _mm256_fmadd_ps(gacc, sv, total1);
++          else
++            total0 = _mm256_fmadd_ps(gacc, sv, total0);
++        }
++        c.data[(size_t)mi * n + ni] = hsum_avx2(_mm256_add_ps(total0, total1));
++      }
++    }
++#undef KT_MXFP4_PREFETCH_NEXT_ROW
++#undef KT_MXFP4_DECODE_GROUP
++    return;
++  }
++
++  // --------------------------------------------------------------------------
++  // group_size == 16 fast path (NVFP4-style layouts: E2M1 nibbles with a scale
++  // every 16 values).  The 32-value block decode above is reused unchanged: a
++  // 16-byte load spans exactly TWO consecutive 16-value groups, and the decode
++  // emits w0/w1 entirely from group 2b and w2/w3 entirely from group 2b+1, so
++  // the only difference from the group-32 path is that each half of the block
++  // is folded with its own scale.  The activation pre-permutation is identical
++  // because kPerm never crosses the 16-value halves (indices 0-15 stay in the
++  // first half, 16-31 in the second).
++  // --------------------------------------------------------------------------
++  if (group_size == 16 && (k % 32) == 0 && (a.perm != nullptr || (size_t)m * (size_t)k <= (size_t)(4 << 20))) {
++    const int* kPerm = GemmKernelAVX2MXFP4::kGroupPerm;
++    static thread_local std::vector<float> a_perm_storage;
++    const int block_count = k / 32;  // 32-value decode blocks; 2 groups each
++    const float* a_perm = (a.perm != nullptr && a.perm_m >= m) ? a.perm : nullptr;
++    if (a_perm == nullptr) {
++      if (a_perm_storage.size() < (size_t)m * k) a_perm_storage.resize((size_t)m * k);
++      float* tmp = a_perm_storage.data();
++      for (int mi = 0; mi < m; mi++) {
++        const ggml_bf16_t* a_row = a.data + (size_t)mi * a.k;
++        float* p_row = tmp + (size_t)mi * k;
++        for (int blk = 0; blk < block_count; blk++) {
++          const int base = blk * 32;
++          float* dst = p_row + base;
++          for (int j = 0; j < 32; j++) dst[j] = GGML_BF16_TO_FP32(a_row[base + kPerm[j]]);
++        }
++      }
++      a_perm = tmp;
++    }
++
++    const __m256i lut_lo256 = _mm256_broadcastsi128_si256(lut_lo);
++    const __m256i lut_hi256 = _mm256_broadcastsi128_si256(lut_hi);
++    const __m256i zero256 = _mm256_setzero_si256();
++    const __m128i nib_mask = _mm_set1_epi8(0x0F);
++
++// Same decode as the group-32 path; here w0/w1 = group 2*blk, w2/w3 = 2*blk+1.
++#define KT_MXFP4_DECODE_GROUP(b_row, g)                                              \
++  const __m128i raw = _mm_loadu_si128((const __m128i*)((b_row) + (size_t)(g) * 16)); \
++  const __m128i lo = _mm_and_si128(raw, nib_mask);                                   \
++  const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nib_mask);                \
++  const __m256i v = _mm256_set_m128i(hi, lo);                                        \
++  const __m256i bl = _mm256_shuffle_epi8(lut_lo256, v);                              \
++  const __m256i bh = _mm256_shuffle_epi8(lut_hi256, v);                              \
++  const __m256i u16a = _mm256_unpacklo_epi8(bl, bh);                                 \
++  const __m256i u16b = _mm256_unpackhi_epi8(bl, bh);                                 \
++  const __m256 w0 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16a));       \
++  const __m256 w1 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16a));       \
++  const __m256 w2 = _mm256_castsi256_ps(_mm256_unpacklo_epi16(zero256, u16b));       \
++  const __m256 w3 = _mm256_castsi256_ps(_mm256_unpackhi_epi16(zero256, u16b))
++
++    // Rows outer, output columns inner. The four activation rows (64 KiB
++    // at k = 4096) then stay in L1 across every output column instead of being
++    // re-streamed once per column; the weights stream instead and are an
++    // eighth the size, and the stores become contiguous. Each output element
++    // keeps its own untouched k loop and is written exactly once, so the
++    // result is bit-identical.
++    int mi = 0;
++    for (; mi + 4 <= m; mi += 4) {
++      const float* p0 = a_perm + (size_t)(mi + 0) * k;
++      const float* p1 = a_perm + (size_t)(mi + 1) * k;
++      const float* p2 = a_perm + (size_t)(mi + 2) * k;
++      const float* p3 = a_perm + (size_t)(mi + 3) * k;
++      for (int ni = n_start; ni < n_end; ni++) {
++        const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++        const float* b_scales = b.d + (size_t)ni * group_count;
++        const uint8_t* b_codes = b.code ? b.code + (size_t)ni * group_count : nullptr;
++        if (b_codes && kt_scale_codes_verify()) b.verify_scale_codes();
++        if (ni + 1 < n_end) {
++          const char* nr = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
++          _mm_prefetch(nr, _MM_HINT_T0);
++          _mm_prefetch(nr + 64, _MM_HINT_T0);
++          _mm_prefetch(nr + 128, _MM_HINT_T0);
++          _mm_prefetch(nr + 192, _MM_HINT_T0);
++        }
++          __m256 tot0 = _mm256_setzero_ps(), tot1 = _mm256_setzero_ps();
++          __m256 tot2 = _mm256_setzero_ps(), tot3 = _mm256_setzero_ps();
++
++          for (int blk = 0; blk < block_count; blk++) {
++            const int base = blk * 32;
++            KT_MXFP4_DECODE_GROUP(b_row, blk);
++            const __m256 sa = _mm256_broadcast_ss(b_codes ? &b.lut[b_codes[2 * blk]] : &b_scales[2 * blk]);
++            const __m256 sb = _mm256_broadcast_ss(b_codes ? &b.lut[b_codes[2 * blk + 1]] : &b_scales[2 * blk + 1]);
++
++            __m256 h0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base), w0);
++            __m256 h1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base), w0);
++            __m256 h2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base), w0);
++            __m256 h3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base), w0);
++            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 8), w1, h0);
++            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 8), w1, h1);
++            h2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 8), w1, h2);
++            h3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 8), w1, h3);
++            tot0 = _mm256_fmadd_ps(h0, sa, tot0);
++            tot1 = _mm256_fmadd_ps(h1, sa, tot1);
++            tot2 = _mm256_fmadd_ps(h2, sa, tot2);
++            tot3 = _mm256_fmadd_ps(h3, sa, tot3);
++
++            h0 = _mm256_mul_ps(_mm256_loadu_ps(p0 + base + 16), w2);
++            h1 = _mm256_mul_ps(_mm256_loadu_ps(p1 + base + 16), w2);
++            h2 = _mm256_mul_ps(_mm256_loadu_ps(p2 + base + 16), w2);
++            h3 = _mm256_mul_ps(_mm256_loadu_ps(p3 + base + 16), w2);
++            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(p0 + base + 24), w3, h0);
++            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(p1 + base + 24), w3, h1);
++            h2 = _mm256_fmadd_ps(_mm256_loadu_ps(p2 + base + 24), w3, h2);
++            h3 = _mm256_fmadd_ps(_mm256_loadu_ps(p3 + base + 24), w3, h3);
++            tot0 = _mm256_fmadd_ps(h0, sb, tot0);
++            tot1 = _mm256_fmadd_ps(h1, sb, tot1);
++            tot2 = _mm256_fmadd_ps(h2, sb, tot2);
++            tot3 = _mm256_fmadd_ps(h3, sb, tot3);
++          }
++          c.data[(size_t)(mi + 0) * n + ni] = hsum_avx2(tot0);
++          c.data[(size_t)(mi + 1) * n + ni] = hsum_avx2(tot1);
++          c.data[(size_t)(mi + 2) * n + ni] = hsum_avx2(tot2);
++          c.data[(size_t)(mi + 3) * n + ni] = hsum_avx2(tot3);      }
++    }
++
++      // Single-row remainder (also the whole decode path when m == 1).  The two
++      // half-scales per block go to their own accumulators; group-16 folds a
++      // scale for each 16-value half, which is twice the group-32 rate, and at
++      // m==1 (no token blocking to amortize the decode) that scale work is the
++      // path's floor -- roughly 1.4x the group-32 single-row cost.  It is a
++      // property of the format's scale density, not the accumulator count: a
++      // four-way split by block parity was measured and made no difference.
++    for (; mi < m; mi++) {
++      const float* ap_row = a_perm + (size_t)mi * k;
++      for (int ni = n_start; ni < n_end; ni++) {
++        const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
++        const float* b_scales = b.d + (size_t)ni * group_count;
++        if (ni + 1 < n_end) {
++          const char* nr = (const char*)(b.b + (size_t)(ni + 1) * row_bytes);
++          _mm_prefetch(nr, _MM_HINT_T0);
++          _mm_prefetch(nr + 64, _MM_HINT_T0);
++          _mm_prefetch(nr + 128, _MM_HINT_T0);
++          _mm_prefetch(nr + 192, _MM_HINT_T0);
++        }
++          __m256 total0 = _mm256_setzero_ps();
++          __m256 total1 = _mm256_setzero_ps();
++          if (b.code != nullptr) {
++            if (kt_scale_codes_verify()) b.verify_scale_codes();
++            // Same loop; the scale comes from the matrix's table by index.
++            const uint8_t* b_codes = b.code + (size_t)ni * group_count;
++            const float* lut = b.lut;
++            for (int blk = 0; blk < block_count; blk++) {
++              const float* ap = ap_row + blk * 32;
++              KT_MXFP4_DECODE_GROUP(b_row, blk);
++
++              __m256 ha = _mm256_mul_ps(_mm256_loadu_ps(ap), w0);
++              ha = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), w1, ha);
++              __m256 hb = _mm256_mul_ps(_mm256_loadu_ps(ap + 16), w2);
++              hb = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), w3, hb);
++
++              total0 = _mm256_fmadd_ps(ha, _mm256_broadcast_ss(&lut[b_codes[2 * blk]]), total0);
++              total1 = _mm256_fmadd_ps(hb, _mm256_broadcast_ss(&lut[b_codes[2 * blk + 1]]), total1);
++            }
++          } else
++          for (int blk = 0; blk < block_count; blk++) {
++            const float* ap = ap_row + blk * 32;
++            KT_MXFP4_DECODE_GROUP(b_row, blk);
++
++            __m256 ha = _mm256_mul_ps(_mm256_loadu_ps(ap), w0);
++            ha = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 8), w1, ha);
++            __m256 hb = _mm256_mul_ps(_mm256_loadu_ps(ap + 16), w2);
++            hb = _mm256_fmadd_ps(_mm256_loadu_ps(ap + 24), w3, hb);
++
++            total0 = _mm256_fmadd_ps(ha, _mm256_broadcast_ss(&b_scales[2 * blk]), total0);
++            total1 = _mm256_fmadd_ps(hb, _mm256_broadcast_ss(&b_scales[2 * blk + 1]), total1);
++          }
++          c.data[(size_t)mi * n + ni] = hsum_avx2(_mm256_add_ps(total0, total1));      }
++    }
++#undef KT_MXFP4_DECODE_GROUP
++    return;
++  }
++
+   for (int ni = n_start; ni < n_end; ni++) {
+     const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
+     const float* b_scales = b.d + (size_t)ni * group_count;
+@@ -373,6 +1320,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+     // Always create full BufferB with owned weight buffer for both modes.
+     return std::make_shared<typename T::BufferB>((int)n, (int)k, config_.quant_config.group_size, data);
+   }
++  std::shared_ptr<typename T::BufferB> make_buffer_b_scale_only_impl(size_t n, size_t k, void* scales) const {
++    return std::make_shared<typename T::BufferB>((int)n, (int)k, config_.quant_config.group_size, scales, nullptr);
++  }
+   std::shared_ptr<typename T::BufferC> make_buffer_c_impl(size_t m, size_t n, void* data) const {
+     return std::make_shared<typename T::BufferC>(m, n, data);
+   }
+@@ -521,6 +1471,13 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+     size_t gpu_tp_weight_bytes = (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / 2;
+     size_t gpu_tp_scale_elem_count =
+         (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / group_size;
++    // KT_WRITE_UP_FIRST=1: w13 as [up; gate] instead of [gate; up], weights
++    // and scales alike, for consumers that store up first (FlashInfer CUTLASS
++    // MXFP4): one contiguous copy per expert instead of two.
++    static const bool up_first = getenv("KT_WRITE_UP_FIRST") != nullptr && getenv("KT_WRITE_UP_FIRST")[0] == '1';
++    const size_t gate_w_half = up_first ? gpu_tp_weight_bytes : 0, up_w_half = up_first ? 0 : gpu_tp_weight_bytes;
++    const size_t gate_s_half = up_first ? gpu_tp_scale_elem_count : 0,
++                 up_s_half = up_first ? 0 : gpu_tp_scale_elem_count;
+ 
+     if (cpu_tp_count >= gpu_tp_count) {
+       int target_gpu_tp = tp_part_idx / (cpu_tp_count / gpu_tp_count);
+@@ -540,10 +1497,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+           [=, this](int tid) {
+             if (tid < NWT) {
+               size_t s = (size_t)tid * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
+-              if (s < e) std::memcpy(w13_wdst + w_off + s, gate_bb_[expert_id]->b + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + w_off + gate_w_half + s, gate_bb_[expert_id]->b + s, e - s);
+             } else if (tid < NWT * 2) {
+               size_t s = (size_t)(tid - NWT) * wchunk, e = std::min(s + wchunk, cpu_tp_weight_bytes);
+-              if (s < e) std::memcpy(w13_wdst + w_off + gpu_tp_weight_bytes + s, up_bb_[expert_id]->b + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + w_off + up_w_half + s, up_bb_[expert_id]->b + s, e - s);
+             } else if (tid < NWT * 2 + ndt) {
+               size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
+               size_t cs = (size_t)(tid - NWT * 2) * cols_per;
+@@ -558,9 +1515,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+                 fp32_to_bf16(w2_sdst + col * gss + gso, down_bb_[expert_id]->d + col * spc, spc);
+               }
+             } else if (tid == NWT * 2 + ndt) {
+-              fp32_to_bf16(w13_sdst + s_off, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
++              fp32_to_bf16(w13_sdst + s_off + gate_s_half, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+             } else {
+-              fp32_to_bf16(w13_sdst + s_off + gpu_tp_scale_elem_count, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
++              fp32_to_bf16(w13_sdst + s_off + up_s_half, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+             }
+           },
+           nullptr);
+@@ -587,10 +1544,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+             size_t cow = (size_t)lg * dw, cos = (size_t)lg * ds;
+             if (tt < NWT) {
+               size_t s = (size_t)tt * wchunk, e = std::min(s + wchunk, dw);
+-              if (s < e) std::memcpy(w13_wdst + s, gate_bb_[expert_id]->b + cow + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + gate_w_half + s, gate_bb_[expert_id]->b + cow + s, e - s);
+             } else if (tt < NWT * 2) {
+               size_t s = (size_t)(tt - NWT) * wchunk, e = std::min(s + wchunk, dw);
+-              if (s < e) std::memcpy(w13_wdst + gpu_tp_weight_bytes + s, up_bb_[expert_id]->b + cow + s, e - s);
++              if (s < e) std::memcpy(w13_wdst + up_w_half + s, up_bb_[expert_id]->b + cow + s, e - s);
+             } else if (tt < NWT * 2 + ndt) {
+               size_t cols_per = (config_.hidden_size + ndt - 1) / ndt;
+               size_t cs = (size_t)(tt - NWT * 2) * cols_per;
+@@ -604,9 +1561,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
+                 fp32_to_bf16(w2_sdst + col * sgc, down_bb_[expert_id]->d + csoff, sgc);
+               }
+             } else if (tt == NWT * 2 + ndt) {
+-              fp32_to_bf16(w13_sdst, gate_bb_[expert_id]->d + cos, ds);
++              fp32_to_bf16(w13_sdst + gate_s_half, gate_bb_[expert_id]->d + cos, ds);
+             } else {
+-              fp32_to_bf16(w13_sdst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cos, ds);
++              fp32_to_bf16(w13_sdst + up_s_half, up_bb_[expert_id]->d + cos, ds);
+             }
+           },
+           nullptr);
+@@ -620,12 +1577,19 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+   std::vector<void*> tp_owned_down_bufs_;
+   std::vector<void*> tp_owned_gate_bufs_;
+   std::vector<void*> tp_owned_up_bufs_;
++  using ExpertArena = typename AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::ExpertArena;
++  // KT_EXPERT_SHM=1: per part [gate_w, up_w, down_w] memfd arenas holding
++  // the packed weights (expert eid at base + eid * stride).
++  std::vector<std::vector<ExpertArena>> tp_weight_arenas_;
+ 
+  public:
+   using Base = TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>>;
+   using Base::Base;
+ 
+   ~TP_MOE() {
++    for (auto& part : tp_weight_arenas_)
++      for (auto& a : part) AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::free_expert_arena(a);
++    if (!tp_weight_arenas_.empty()) return;  // those pointers were arena bases
+     for (void* p : tp_owned_down_bufs_)
+       if (p) std::free(p);
+     for (void* p : tp_owned_gate_bufs_)
+@@ -634,6 +1598,21 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+       if (p) std::free(p);
+   }
+ 
++  // Per TP part: [(fd, size, stride)] for gate_w, up_w, down_w, gate_s,
++  // up_s, down_s (KT_EXPERT_SHM=1; empty otherwise). Weights are packed
++  // e2m1 bytes, N x K/2 (gate/up) or K x N/2 (down) per expert; scales fp32.
++  std::vector<std::vector<std::tuple<int, size_t, size_t>>> expert_arena_infos() const {
++    std::vector<std::vector<std::tuple<int, size_t, size_t>>> out;
++    for (size_t i = 0; i < this->tps.size(); i++) {
++      std::vector<std::tuple<int, size_t, size_t>> v;
++      if (i < tp_weight_arenas_.size())
++        for (auto& a : tp_weight_arenas_[i]) v.emplace_back(a.fd, a.size, a.stride);
++      for (auto& t : this->tps[i]->expert_arena_info()) v.push_back(t);
++      out.push_back(v);
++    }
++    return out;
++  }
++
+   void load_weights() override {
+     auto& config = this->config;
+     auto& tps = this->tps;
+@@ -664,16 +1643,41 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+         // gate/up: [intermediate × hidden] = [N × K], TP slices along N → contiguous rows
+         size_t gate_up_wt_per_expert = (size_t)per_tp_interm * tpc.hidden_size / 2;
+         size_t gate_up_alloc = ((size_t)tpc.expert_num * gate_up_wt_per_expert + 63) & ~(size_t)63;
+-        uint8_t* gate_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
+-        uint8_t* up_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
+-        if (!gate_buf || !up_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 gate/up_buf");
+-        tp_owned_gate_bufs_[i] = gate_buf;
+-        tp_owned_up_bufs_[i] = up_buf;
+-        // down: [hidden × intermediate], TP slices along K → non-contiguous
+         size_t down_wt_per_expert = (size_t)tpc.hidden_size * per_tp_interm / 2;
+         size_t alloc_size = ((size_t)tpc.expert_num * down_wt_per_expert + 63) & ~(size_t)63;
+-        uint8_t* down_buf = (uint8_t*)std::aligned_alloc(64, alloc_size);
+-        if (!down_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 down_buf");
++        uint8_t *gate_buf, *up_buf, *down_buf;
++        if (AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::expert_shm_enabled()) {
++          // Weight bytes per expert are 64-aligned already for these shapes,
++          // so arena stride == gate_up_wt_per_expert and the per-expert
++          // pointer arithmetic below stays valid.
++          if (gate_up_wt_per_expert % 64 || down_wt_per_expert % 64)
++            throw std::runtime_error("KT_EXPERT_SHM: per-expert weight bytes must be 64-aligned");
++          std::vector<ExpertArena> arenas;
++          arenas.push_back(AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::make_expert_arena(
++              gate_up_wt_per_expert, tpc.expert_num, "kt_gate_w"));
++          arenas.push_back(AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::make_expert_arena(
++              gate_up_wt_per_expert, tpc.expert_num, "kt_up_w"));
++          arenas.push_back(AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>::make_expert_arena(
++              down_wt_per_expert, tpc.expert_num, "kt_down_w"));
++          gate_buf = arenas[0].base;
++          up_buf = arenas[1].base;
++          down_buf = arenas[2].base;
++          {
++            static std::mutex m;
++            std::lock_guard<std::mutex> g(m);
++            if (tp_weight_arenas_.size() < this->tps.size()) tp_weight_arenas_.resize(this->tps.size());
++            tp_weight_arenas_[i] = std::move(arenas);
++          }
++        } else {
++          gate_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
++          up_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
++          if (!gate_buf || !up_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 gate/up_buf");
++          // down: [hidden × intermediate], TP slices along K → non-contiguous
++          down_buf = (uint8_t*)std::aligned_alloc(64, alloc_size);
++          if (!down_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 down_buf");
++        }
++        tp_owned_gate_bufs_[i] = gate_buf;
++        tp_owned_up_bufs_[i] = up_buf;
+         tp_owned_down_bufs_[i] = down_buf;
+ 
+         auto subpool = pool->get_subpool(i);
+@@ -820,6 +1824,26 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
+       });
+     }
+ 
++    if (kt_mxfp4_scale_codes()) {
++      std::atomic<size_t> built{0}, total{0};
++      pool->dispense_backend()->do_numa_job([&, this](int i) {
++        auto* tp = tps[i].get();
++        auto& tpc = tp->config_;
++        pool->get_subpool(i)->do_work_stealing_job(
++            tpc.expert_num, nullptr,
++            [&, tp](int eid) {
++              if (tpc.should_skip_expert(eid) && !kt_scale_codes_load_all()) return;
++              for (auto* bb : {tp->gate_bb_[eid].get(), tp->up_bb_[eid].get(), tp->down_bb_[eid].get()}) {
++                if (bb == nullptr) continue;
++                total++;
++                if (bb->build_scale_codes()) built++;
++              }
++            },
++            nullptr);
++      });
++      printf("KT_MXFP4_SCALE_CODES: %zu of %zu matrices read one-byte scale codes\n", built.load(), total.load());
++    }
++
+     this->weights_loaded = true;
+   }
+ 
+diff --git a/kt-kernel/operators/common.hpp b/kt-kernel/operators/common.hpp
+index f943935..6549a5c 100644
+--- a/kt-kernel/operators/common.hpp
++++ b/kt-kernel/operators/common.hpp
+@@ -227,6 +227,14 @@ struct QuantConfig {
+   bool per_channel = false;  // Per-channel quantization (GLM-4.7-FP8 style)
+ };
+ 
++// Routed-expert activation selected by the model integration. Keep SILU as
++// zero so existing callers and default-constructed configs retain their
++// historical behavior.
++enum MOEActivationType : int {
++  MOE_ACTIVATION_SILU = 0,
++  MOE_ACTIVATION_GELU_TANH = 1,
++};
++
+ struct GeneralMOEConfig {
+   // Basic Config
+   int expert_num;
+@@ -324,6 +332,11 @@ struct GeneralMOEConfig {
+   // both gate and up (±swiglu_limit). 0.0f = disabled (standard silu path).
+   float swiglu_alpha = 0.0f;
+ 
++  // Activation used between gate/up projection and down projection.
++  // GELU_TANH is the Gemma 4 GeGLU definition:
++  // gelu_pytorch_tanh(gate) * up.
++  int activation_type = MOE_ACTIVATION_SILU;
++
+   GeneralMOEConfig() {}
+ 
+   GeneralMOEConfig(int expert_num, int routed_expert_num, int hidden_size, int intermediate_size)
+diff --git a/kt-kernel/operators/moe-tp.hpp b/kt-kernel/operators/moe-tp.hpp
+index 66f722c..176caea 100644
+--- a/kt-kernel/operators/moe-tp.hpp
++++ b/kt-kernel/operators/moe-tp.hpp
+@@ -3,6 +3,9 @@
+ 
+ // #define CHECK
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstdint>
+ #include <cstdio>
+ #include <exception>
+@@ -209,11 +212,33 @@ class TP_MOE_Common : public MoE_Interface {
+     int qlen = *qlen_ptr;
+ 
+     auto pool = config.pool;
++    static const int kt_every = [] {
++      const char* e = std::getenv("KT_DECODE_PHASES");
++      return e ? std::atoi(e) : 0;
++    }();
++    const bool kt_timed = kt_every > 0 && qlen == 1;
++    std::chrono::steady_clock::time_point kt_a, kt_b;
++    if (kt_timed) kt_a = std::chrono::steady_clock::now();
+     pool->dispense_backend()->do_numa_job([this, pool, qlen, k, expert_ids, input, weights](int numa_id) {
+       tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
+     });
++    if (kt_timed) kt_b = std::chrono::steady_clock::now();
+ 
+     merge_results(qlen, output, incremental);
++    if (kt_timed) {
++      static double numa_us = 0, merge_us = 0;
++      static long calls = 0;
++      auto kt_c = std::chrono::steady_clock::now();
++      numa_us += std::chrono::duration<double, std::micro>(kt_b - kt_a).count();
++      merge_us += std::chrono::duration<double, std::micro>(kt_c - kt_b).count();
++      if (++calls == kt_every) {
++        std::printf("[kt-decode] tp, %ld calls: numa fan-out+compute+join %.1f us, merge %.1f us\n", calls,
++                    numa_us / calls, merge_us / calls);
++        std::fflush(stdout);
++        numa_us = merge_us = 0;
++        calls = 0;
++      }
++    }
+ #ifdef FORWARD_TIME_REPORT
+     auto end = std::chrono::high_resolution_clock::now();
+     auto forward_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+diff --git a/kt-kernel/pyproject.toml b/kt-kernel/pyproject.toml
+index f877dda..fd44c21 100644
+--- a/kt-kernel/pyproject.toml
++++ b/kt-kernel/pyproject.toml
+@@ -21,7 +21,9 @@ classifiers = [
+ requires-python = ">=3.11"
+ dependencies = [
+   # Core dependencies
+-  "torch==2.9.1",
++  # The native CPU extension does not link libtorch. Keep compatibility with
++  # SGLang's newer validated Torch runtime instead of forcing a CUDA downgrade.
++  "torch>=2.9.1",
+   "safetensors>=0.4.0",
+   "numpy>=1.24.0",
+   "triton>=2.0.0",
+diff --git a/kt-kernel/python/experts.py b/kt-kernel/python/experts.py
+index 93a973e..7b15cc6 100644
+--- a/kt-kernel/python/experts.py
++++ b/kt-kernel/python/experts.py
+@@ -41,6 +41,7 @@ INFERENCE_METHODS = frozenset(
+         "GPTQ_INT4",  # GPTQ INT4
+         "SYCL_GPTQ_INT4",  # GPTQ INT4 experts on a SYCL device
+         "MXFP4",  # MXFP4 (E2M1 nibble + ue8m0 group scale, e.g. DeepSeek-V4-Flash routed experts)
++        "NVFP4",  # NVFP4 (E2M1 nibble + e4m3 per-16 block scale x per-tensor global, ModelOpt)
+         "MXFP8",  # MXFP8 (E4M3fn byte + ue8m0 group scale, e.g. MiniMax-M3-Preview)
+         "LLAMAFILE",  # GGUF format
+         "MOE_INT4",
+@@ -158,6 +159,9 @@ class KTMoEWrapper:
+         # MiniMax M3 swigluoai sigmoid alpha. 0.0 = standard silu (default).
+         # Non-zero triggers gate * sigmoid(gate * alpha) * (up + 1) in act_fn.
+         swiglu_alpha: float = 0.0,
++        # Gemma 4 BF16 uses gelu_pytorch_tanh(gate) * up. Existing callers
++        # retain the historical SiLU default.
++        activation: str = "silu",
+     ):
+         """
+         Factory method to create the appropriate backend implementation.
+@@ -230,6 +234,7 @@ class KTMoEWrapper:
+                 numa_nodes=numa_nodes,
+                 swiglu_limit=swiglu_limit,
+                 swiglu_alpha=swiglu_alpha,
++                activation=activation,
+             )
+         else:  # mode == "sft"
+             # SFT factory does not plumb swiglu_limit; reject non-zero
+@@ -240,6 +245,11 @@ class KTMoEWrapper:
+                     f"mode='sft' (method={method!r}); SFT backends do not "
+                     f"implement the V4-2604B clamp."
+                 )
++            if activation != "silu":
++                raise ValueError(
++                    f"activation={activation!r} is not supported in mode='sft'; "
++                    "SFT backends currently implement SiLU only."
++                )
+             return _create_sft_wrapper(
+                 layer_idx=layer_idx,
+                 num_experts=num_experts,
+@@ -330,6 +340,7 @@ def _create_inference_wrapper(
+     numa_nodes: Optional[List[int]] = None,
+     swiglu_limit: float = 0.0,
+     swiglu_alpha: float = 0.0,
++    activation: str = "silu",
+ ) -> BaseMoEWrapper:
+     """
+     Create an inference wrapper based on the method.
+@@ -351,6 +362,7 @@ def _create_inference_wrapper(
+         "GPTQ_INT4",
+         "SYCL_GPTQ_INT4",
+         "MXFP4",
++        "NVFP4",
+         "MXFP8",
+     ]:
+         backend_cls = NativeMoEWrapper
+@@ -362,6 +374,18 @@ def _create_inference_wrapper(
+         # This shouldn't happen due to validation in __new__
+         raise NotImplementedError(f"Unsupported inference method: {method}")
+ 
++    activation = activation.strip().lower()
++    supported_activations = {"silu", "gelu_pytorch_tanh"}
++    if activation not in supported_activations:
++        raise ValueError(
++            f"Unsupported activation={activation!r}; supported: {sorted(supported_activations)}"
++        )
++    if activation != "silu" and method != "BF16":
++        raise ValueError(
++            f"activation={activation!r} is currently supported only with method='BF16', "
++            f"got method={method!r}."
++        )
++
+     # Create and return backend instance.
+     # `swiglu_limit != 0` is meaningful only on the MXFP4 path. NativeMoEWrapper
+     # also serves RAWINT4 / FP8 / BF16 / FP8_PERCHANNEL / GPTQ_INT4, so a
+@@ -373,6 +397,8 @@ def _create_inference_wrapper(
+     if method in ("MXFP4", "MXFP8"):
+         extra_kwargs["swiglu_limit"] = swiglu_limit
+         extra_kwargs["swiglu_alpha"] = swiglu_alpha
++    elif method == "BF16":
++        extra_kwargs["activation"] = activation
+     elif swiglu_limit != 0.0:
+         raise ValueError(
+             f"swiglu_limit={swiglu_limit} is only supported on method='MXFP4'/'MXFP8', "
+diff --git a/kt-kernel/python/experts_base.py b/kt-kernel/python/experts_base.py
+index bc58b98..dd57e84 100644
+--- a/kt-kernel/python/experts_base.py
++++ b/kt-kernel/python/experts_base.py
+@@ -84,6 +84,49 @@ class KExpertsCPUBuffer:
+     temp_bs: int = 0
+     temp_buffer: tuple = tuple()
+     buffer_depth: int = 2
++    # (device, dtype, hidden) -> (rows, [base] * buffer_depth); see _gpu_output.
++    gpu_output_bases: Dict = dict()
++
++    @classmethod
++    def _gpu_output(cls, batch_size, hidden_size, device, dtype):
++        """output_gpu for one batch size. With KT_SHARED_GPU_OUTPUT=1 (default)
++        every size gets views of one base per depth slot instead of its own
++        [batch_size, hidden] tensors; a view keeps its base alive, so graphs
++        that baked an older base stay valid when the base grows."""
++        if os.environ.get("KT_SHARED_GPU_OUTPUT", "1") != "1":
++            return [
++                torch.zeros((batch_size, hidden_size), device=device, dtype=dtype)
++                for _ in range(cls.buffer_depth)
++            ]
++        key = (str(device), dtype, hidden_size)
++        # patches/kt-kernel-lend-gpu-output.py: inside a KT prefill lend window
++        # the buffer lives in the lend scratch, so the prefill-sized base is not
++        # kept through decode
++        region = None
++        try:
++            from sglang.srt.layers.moe import kt_lend
++
++            if kt_lend.ENABLED and kt_lend.phase() == "prefill":
++                key = key + ("prefill",)
++                region = kt_lend.scratch_region
++        except ImportError:
++            pass
++        rows, bases = cls.gpu_output_bases.get(key, (0, None))
++        if bases is None or rows < batch_size:
++            rows = max(batch_size, 2048)
++            if region is None:
++                bases = [
++                    torch.zeros((rows, hidden_size), device=device, dtype=dtype)
++                    for _ in range(cls.buffer_depth)
++                ]
++            else:
++                with region():
++                    bases = [
++                        torch.zeros((rows, hidden_size), device=device, dtype=dtype)
++                        for _ in range(cls.buffer_depth)
++                    ]
++            cls.gpu_output_bases[key] = (rows, bases)
++        return [b[:batch_size] for b in bases]
+ 
+     @classmethod
+     def get_buffer(cls, hidden_states: torch.Tensor, num_experts_per_tok):
+@@ -121,10 +164,7 @@ class KExpertsCPUBuffer:
+             torch.full((1,), batch_size, device="cpu", dtype=torch.int32, pin_memory=pin_memory)
+             for _ in range(cls.buffer_depth)
+         ]
+-        output_gpu = [
+-            torch.zeros((batch_size, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
+-            for _ in range(cls.buffer_depth)
+-        ]
++        output_gpu = cls._gpu_output(batch_size, hidden_size, hidden_states.device, hidden_states.dtype)
+ 
+         cur_buffer = (
+             input_tensor_cpu,
+@@ -135,8 +175,13 @@ class KExpertsCPUBuffer:
+             bsz_tensor_cpu,
+             output_gpu,
+         )
+-        if batch_size in cls.capture_bs:
+-            cls.capture_buffers[batch_size] = cur_buffer
++        # Cache buffers for every size unconditionally.  A CUDA graph captured
++        # around submit_forward bakes these pinned-host pointers into the
++        # graph; the old temp-slot scheme dropped a buffer as soon as a
++        # different size was requested, so a graph captured against the temp
++        # buffer segfaulted on replay.  Each cached size costs only a few
++        # hundred KiB of pinned memory.
++        cls.capture_buffers[batch_size] = cur_buffer
+         cls.temp_bs = batch_size
+         cls.temp_buffer = cur_buffer
+         return cur_buffer
+@@ -249,6 +294,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
+         method: str = "AMXINT4",
+         numa_nodes: Optional[List[int]] = None,
+         swiglu_limit: float = 0.0,
++        activation: str = "silu",
+     ):
+         """
+         Initialize base MoE Wrapper.
+@@ -308,6 +354,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
+         # MOEConfig.swiglu_limit. Other backends ignore it (C++ act_fn skips
+         # the clamp branch when limit==0). Origin: kt-sglang 耦合.
+         self.swiglu_limit = float(swiglu_limit)
++        self.activation = activation
+ 
+         # Initialize CPU inference engine (singleton via shared base class)
+         self.cpu_infer = self._get_cpu_infer(cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes)
+@@ -541,4 +588,3 @@ class BaseMoEWrapper(_MoEBase, ABC):
+         KExpertsCPUBuffer.capture_buffers.clear()
+         KExpertsCPUBuffer.temp_bs = 0
+         KExpertsCPUBuffer.temp_buffer = tuple()
+-
+diff --git a/kt-kernel/python/utils/amx.py b/kt-kernel/python/utils/amx.py
+index 3d28612..3548d0a 100644
+--- a/kt-kernel/python/utils/amx.py
++++ b/kt-kernel/python/utils/amx.py
+@@ -17,6 +17,7 @@ from .loader import (
+     BF16SafeTensorLoader,
+     GPTQSafeTensorLoader,
+     MXFP4SafeTensorLoader,
++    NVFP4SafeTensorLoader,
+     MXFP8SafeTensorLoader,
+ )
+ from kt_kernel_ext.moe import MOEConfig
+@@ -569,8 +570,18 @@ class NativeMoEWrapper(BaseMoEWrapper):
+         numa_nodes: Optional[List[int]] = None,
+         swiglu_limit: float = 0.0,
+         swiglu_alpha: float = 0.0,
++        activation: str = "silu",
+     ):
+         self._swiglu_alpha = float(swiglu_alpha)
++        activation = activation.strip().lower()
++        if activation not in ("silu", "gelu_pytorch_tanh"):
++            raise ValueError(f"Unsupported NativeMoEWrapper activation={activation!r}")
++        if activation != "silu" and method != "BF16":
++            raise ValueError(
++                f"activation={activation!r} is only supported by the BF16 native backend, "
++                f"got method={method!r}."
++            )
++        self._activation = activation
+         # Defence in depth: reject swiglu_limit on non-MXFP4/MXFP8 methods even
+         # if the experts.py guard is bypassed (e.g., by a future caller
+         # that constructs NativeMoEWrapper directly). Origin: kt-sglang 耦合.
+@@ -621,6 +632,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
+                 "SYCL_GPTQ_INT4 backend not available. Rebuild kt_kernel_ext with "
+                 "CPUINFER_USE_SYCL=1 using a SYCL compiler such as icpx."
+             )
++        if method == "NVFP4" and not _HAS_AVX2_MXFP4_SUPPORT:
++            raise RuntimeError(
++                "NVFP4 needs the AVX2 FP4 backend (AVX2MXFP4_MOE), which is not compiled in."
++            )
+         if method == "MXFP4" and not (_HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT):
+             raise RuntimeError(
+                 "MXFP4 backend not available. Required ISA (any one of):\n"
+@@ -652,6 +667,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
+             method=method,
+             numa_nodes=numa_nodes,
+             swiglu_limit=swiglu_limit,
++            activation=activation,
+         )
+ 
+         if NativeMoEWrapper._native_loader_instance is None:
+@@ -679,6 +695,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
+             return GPTQSafeTensorLoader(weight_path)
+         elif method == "MXFP4":
+             return MXFP4SafeTensorLoader(weight_path)
++        elif method == "NVFP4":
++            return NVFP4SafeTensorLoader(weight_path)
+         elif method == "MXFP8":
+             return MXFP8SafeTensorLoader(weight_path)
+         else:
+@@ -727,11 +745,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
+             self.loader = NativeMoEWrapper._native_loader_instance
+ 
+         t0 = time.time()
+-        _candidates = [
+-            f"model.layers.{self.layer_idx}",
+-            f"language_model.model.layers.{self.layer_idx}",
+-            f"model.language_model.layers.{self.layer_idx}",
+-        ]
++        _explicit_base_key = getattr(self, "weight_base_key", None)
++        _candidates = (
++            [_explicit_base_key]
++            if _explicit_base_key is not None
++            else [
++                f"model.layers.{self.layer_idx}",
++                f"language_model.model.layers.{self.layer_idx}",
++                f"model.language_model.layers.{self.layer_idx}",
++            ]
++        )
+         weights = None
+         for base_key in _candidates:
+             try:
+@@ -781,6 +804,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
+                 # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
+                 # the loader has already done that conversion.
+                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
++            elif self.method == "NVFP4":
++                # e4m3 block scale x per-tensor global, folded to bf16 by the loader.
++                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for NVFP4"
+             elif self.method == "MXFP8":
+                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
+                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
+@@ -828,6 +854,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
+                 f"only valid for MXFP4/MXFP8."
+             )
+         moe_config.swiglu_limit = self.swiglu_limit
++        moe_config.activation_type = (
++            1 if self._activation == "gelu_pytorch_tanh" else 0
++        )
+ 
+         # Use gate_projs instead of gate_proj for per-expert pointers
+         moe_config.gate_projs = gate_ptrs
+@@ -869,6 +898,35 @@ class NativeMoEWrapper(BaseMoEWrapper):
+                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
+                 )
+             self.moe = backend_cls(moe_config)
++        elif self.method == "NVFP4":
++            # NVFP4: same E2M1 nibble packing as MXFP4, but a per-16 block scale
++            # in E4M3 times a per-tensor global scale. The loader has already
++            # folded both into one bf16 scale per group, so the FP4 kernel runs
++            # this unchanged -- only group_size differs (16 vs 32).
++            group_size = self.hidden_size // self.gate_scales[0].shape[1]
++            if group_size != 16:
++                raise RuntimeError(
++                    f"NVFP4 expects group_size 16, derived {group_size} from "
++                    f"hidden_size={self.hidden_size} and scale shape "
++                    f"{tuple(self.gate_scales[0].shape)}."
++                )
++            moe_config.quant_config.bits = 4
++            moe_config.quant_config.group_size = group_size
++            moe_config.quant_config.zero_point = False
++            backend_cls = _select_mxfp4_backend()
++            if backend_cls is None:
++                raise RuntimeError(
++                    "No FP4 backend available for NVFP4 after runtime selection. "
++                    "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
++                )
++            if backend_cls is not AVX2MXFP4_MOE:
++                # Only the AVX2 kernel has the group-16 path; the AMX FP4 kernel
++                # is built around a 32-value k-group.
++                raise RuntimeError(
++                    "NVFP4 (group_size 16) currently requires the AVX2 FP4 backend. "
++                    "Set KT_MXFP4_BACKEND=avx2, or extend the AMX kernel to group-16."
++                )
++            self.moe = backend_cls(moe_config)
+         elif self.method == "MXFP8":
+             # MXFP8: FP8 E4M3fn byte weights, ue8m0/uint8 per-32 group scale
+             # (e.g. MiniMax-M3-Preview)
+@@ -924,9 +982,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
+             _preflight_sycl_device()
+             self.moe = SYCLGPTQInt4_MOE(moe_config)
+         elif self.method == "BF16":
+-            # BF16 has no quantization config needed
+-            # Prefer AMX backend, fall back to AVX2
+-            if _HAS_BF16_SUPPORT:
++            # Gemma 4 GeGLU is implemented in the AVX2 BF16 kernel. Keep the
++            # existing AMX preference for the historical SiLU path.
++            if self._activation == "gelu_pytorch_tanh":
++                if not _HAS_AVX2_BF16_SUPPORT:
++                    raise RuntimeError(
++                        "gelu_pytorch_tanh requires the AVX2 BF16 backend, "
++                        "but AVX2BF16_MOE is not compiled in."
++                    )
++                self.moe = AVX2BF16_MOE(moe_config)
++            elif _HAS_BF16_SUPPORT:
+                 self.moe = AMXBF16_MOE(moe_config)
+             else:
+                 self.moe = AVX2BF16_MOE(moe_config)
+diff --git a/kt-kernel/python/utils/loader.py b/kt-kernel/python/utils/loader.py
+index c24f789..24b68ee 100644
+--- a/kt-kernel/python/utils/loader.py
++++ b/kt-kernel/python/utils/loader.py
+@@ -519,6 +519,8 @@ class BF16SafeTensorLoader(SafeTensorLoader):
+     - DeepSeek style: {base}.mlp.experts.{id}.{gate,up,down}_proj.weight
+     - Mixtral/MiniMax style: {base}.block_sparse_moe.experts.{id}.{w1,w3,w2}.weight
+     - Mistral style: {base}.experts.{id}.{w1,w3,w2}.weight
++    - Packed Qwen style: {base}.mlp.experts.{gate_up,down}_proj
++    - Packed Gemma 4 style: {base}.experts.{gate_up,down}_proj
+ 
+     The format is auto-detected during initialization.
+     """
+@@ -540,9 +542,9 @@ class BF16SafeTensorLoader(SafeTensorLoader):
+ 
+         # Check for packed format first (Qwen3.5 MoE style: all experts in one 3D tensor)
+         for key in sample_keys:
+-            if key.endswith(".mlp.experts.gate_up_proj"):
++            if key.endswith((".mlp.experts.gate_up_proj", ".experts.gate_up_proj")):
+                 self._detected_format = "packed"
+-                print("[BF16SafeTensorLoader] Detected format: packed (Qwen3.5 MoE style)")
++                print("[BF16SafeTensorLoader] Detected format: packed")
+                 return
+ 
+         for fmt_name, (path_tpl, gate, up, down) in self.MOE_FORMATS.items():
+@@ -594,7 +596,16 @@ class BF16SafeTensorLoader(SafeTensorLoader):
+ 
+     def load_experts(self, base_key: str, device: str = "cpu"):
+         """Load BF16 expert weights (no scales needed)."""
+-        if self._detected_format == "packed":
++        # A mixed checkpoint can keep quantized target experts first and one
++        # packed BF16 MTP layer near the end of the index. Global detection
++        # from a key sample then describes the target, not this base_key.
++        # Resolve the requested layer itself before using the global fallback.
++        try:
++            self._resolve_packed_experts_prefix(base_key)
++        except ValueError:
++            if self._detected_format == "packed":
++                raise
++        else:
+             return self._load_experts_packed(base_key, device)
+ 
+         experts_prefix_candidates = self._get_experts_prefix_candidates(base_key)
+@@ -634,23 +645,32 @@ class BF16SafeTensorLoader(SafeTensorLoader):
+ 
+     def _resolve_packed_experts_prefix(self, base_key: str) -> str:
+         """Resolve the experts prefix for packed format, trying fallbacks."""
+-        # Direct: model.layers.{N}.mlp.experts
+-        experts_prefix = f"{base_key}.mlp.experts"
+-        if self.has_tensor(f"{experts_prefix}.gate_up_proj"):
+-            return experts_prefix
+-
+-        # VL models: model.layers.{N} -> model.language_model.layers.{N}
+-        parts = base_key.split(".", 1)
+-        if len(parts) == 2:
+-            alt_base = f"{parts[0]}.language_model.{parts[1]}"
+-            experts_prefix = f"{alt_base}.mlp.experts"
++        base_candidates = [base_key]
++
++        # Multimodal checkpoints commonly insert language_model after model:
++        # model.layers.{N} -> model.language_model.layers.{N}.
++        if base_key.startswith("model.") and not base_key.startswith("model.language_model."):
++            base_candidates.append(f"model.language_model.{base_key[len('model.'):]}")
++
++        # Qwen stores the packed tensors below mlp.experts, while Gemma 4
++        # stores them directly below layers.N.experts.
++        prefix_candidates = []
++        for candidate in base_candidates:
++            prefix_candidates.extend(
++                (f"{candidate}.mlp.experts", f"{candidate}.experts")
++            )
++
++        for experts_prefix in dict.fromkeys(prefix_candidates):
+             if self.has_tensor(f"{experts_prefix}.gate_up_proj"):
+                 return experts_prefix
+ 
+-        raise ValueError(f"No packed experts found for base_key '{base_key}'.")
++        raise ValueError(
++            f"No packed experts found for base_key '{base_key}'. "
++            f"Tried: {list(dict.fromkeys(prefix_candidates))}"
++        )
+ 
+     def _load_experts_packed(self, base_key: str, device: str = "cpu"):
+-        """Load packed expert weights (Qwen3.5 MoE style).
++        """Load packed expert weights (Qwen3.5/Gemma 4 style).
+ 
+         Packed format stores all experts in stacked 3D tensors:
+         - gate_up_proj: [num_experts, 2 * intermediate_size, hidden_size]
+@@ -1199,6 +1219,9 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
+ 
+     EXPERTS_PATH_TPL = "{base}.ffn.experts"
+     PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
++    SCALE_SUFFIX = "scale"
++    # MiMo-V2.x: {base}.mlp.experts.{i}.{gate,up,down}_proj.{weight,weight_scale}
++    MIMO_LAYOUT = ("{base}.mlp.experts", ("gate_proj", "up_proj", "down_proj"), "weight_scale")
+ 
+     def _experts_prefix_candidates(self, base_key: str) -> list[str]:
+         candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
+@@ -1206,6 +1229,11 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
+             candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len("model.") :]))
+         return list(dict.fromkeys(candidates))
+ 
++    def _use_mimo_layout_if_present(self, base_key: str) -> None:
++        tpl, names, suffix = self.MIMO_LAYOUT
++        if self.has_tensor(f"{tpl.format(base=base_key)}.0.{names[0]}.weight"):
++            self.EXPERTS_PATH_TPL, self.PROJ_NAMES, self.SCALE_SUFFIX = tpl, names, suffix
++
+     @staticmethod
+     def _ue8m0_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
+         if scale_t.dtype != torch.uint8:
+@@ -1218,6 +1246,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
+         return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
+ 
+     def load_experts(self, base_key: str, device: str = "cpu"):
++        self._use_mimo_layout_if_present(base_key)
+         gate_name, up_name, down_name = self.PROJ_NAMES
+         prefix = None
+         expert_count = 0
+@@ -1256,7 +1285,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
+                 (up_name, up_scales),
+                 (down_name, down_scales),
+             ):
+-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
++                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{self.SCALE_SUFFIX}", device)
+                 dst[exp_id] = self._ue8m0_to_bf16(s)
+ 
+         print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+@@ -1270,6 +1299,99 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
+         }
+ 
+ 
++class NVFP4SafeTensorLoader(SafeTensorLoader):
++    """Loader for ModelOpt NVFP4 expert weights (W4A16_NVFP4, group_size 16).
++
++    Per expert layout (compressed-tensors / ModelOpt naming):
++      {base}.mlp.experts.{i}.gate_proj.weight          U8        [N, K/2]   nibble-packed E2M1
++      {base}.mlp.experts.{i}.gate_proj.weight_scale    F8_E4M3   [N, K/16]  per-block scale
++      {base}.mlp.experts.{i}.gate_proj.weight_scale_2  F32       scalar     per-tensor global
++      {base}.mlp.experts.{i}.{up_proj,down_proj}.{weight,weight_scale,weight_scale_2}
++
++    NVFP4 shares MXFP4's E2M1 codepoints and low-nibble-first packing, so the
++    weight bytes go to the FP4 kernel untouched; only the scale encoding differs.
++    The kernel consumes one FP32-valued scale per k-group, so both levels are
++    folded here into a single bf16 tensor:
++
++        scale[n, g] = float(e4m3(weight_scale[n, g])) * weight_scale_2
++
++    bf16 is lossy for E4M3 products (8 mantissa bits down to 7), which is what
++    the kernel's own group-32 MXFP4 path already accepts; measured against a
++    float64 dequant of the same bytes the end-to-end error is bf16-rounding
++    only (cosine 0.999993 on Ornith-1.5-35B-A3B-NVFP4).
++    """
++
++    EXPERTS_PATH_TPL = "{base}.mlp.experts"
++    PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
++
++    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
++        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
++        for strip in ("model.language_model.", "language_model.model.", "language_model.", "model."):
++            if base_key.startswith(strip):
++                candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len(strip):]))
++        # ModelOpt checkpoints for multimodal Qwen3.5-MoE nest under
++        # model.language_model.layers.{L}; callers may pass either form.
++        if not base_key.startswith("model.language_model."):
++            for pre in ("model.language_model.", "language_model.model."):
++                if base_key.startswith("model."):
++                    candidates.append(self.EXPERTS_PATH_TPL.format(base=pre + base_key[len("model."):]))
++        return list(dict.fromkeys(candidates))
++
++    @staticmethod
++    def _fold_scales_to_bf16(block_scale: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
++        """e4m3 block scale x per-tensor f32 global -> bf16 [N, K/16]."""
++        s = block_scale.to(torch.float32) * global_scale.to(torch.float32).reshape(())
++        return s.to(torch.bfloat16).contiguous()
++
++    def load_experts(self, base_key: str, device: str = "cpu"):
++        gate_name, up_name, down_name = self.PROJ_NAMES
++        prefix = None
++        expert_count = 0
++        for cand in self._experts_prefix_candidates(base_key):
++            expert_count = 0
++            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
++                expert_count += 1
++            if expert_count > 0:
++                prefix = cand
++                break
++        if prefix is None:
++            raise ValueError(
++                f"No NVFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
++            )
++
++        gate_weights = [None] * expert_count
++        up_weights = [None] * expert_count
++        down_weights = [None] * expert_count
++        gate_scales = [None] * expert_count
++        up_scales = [None] * expert_count
++        down_scales = [None] * expert_count
++
++        for exp_id in range(expert_count):
++            for proj, wdst, sdst in (
++                (gate_name, gate_weights, gate_scales),
++                (up_name, up_weights, up_scales),
++                (down_name, down_weights, down_scales),
++            ):
++                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
++                if w.dtype != torch.uint8:
++                    w = w.view(torch.uint8)
++                wdst[exp_id] = w
++
++                bs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale", device)
++                gs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale_2", device)
++                sdst[exp_id] = self._fold_scales_to_bf16(bs, gs)
++
++        print(f"[NVFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
++        return {
++            "gate": gate_weights,
++            "up": up_weights,
++            "down": down_weights,
++            "gate_scale": gate_scales,
++            "up_scale": up_scales,
++            "down_scale": down_scales,
++        }
++
++
+ class MXFP8SafeTensorLoader(SafeTensorLoader):
+     """Loader for native MXFP8 expert weights (MiniMax M3 Preview format).
+ 
+diff --git a/kt-kernel/test/per_commit/test_bf16_activation_policy.py b/kt-kernel/test/per_commit/test_bf16_activation_policy.py
+new file mode 100644
+index 0000000..d4ceb26
+--- /dev/null
++++ b/kt-kernel/test/per_commit/test_bf16_activation_policy.py
+@@ -0,0 +1,51 @@
++"""Python factory policy for native BF16 routed-expert activations."""
++
++import pytest
++import torch
++
++import kt_kernel.experts as experts
++
++
++class _CapturedNativeWrapper:
++    def __init__(self, **kwargs):
++        self.kwargs = kwargs
++
++
++def _create(monkeypatch, *, method="BF16", activation="silu"):
++    monkeypatch.setattr(experts, "NativeMoEWrapper", _CapturedNativeWrapper)
++    return experts._create_inference_wrapper(
++        layer_idx=0,
++        num_experts=4,
++        num_experts_per_tok=2,
++        hidden_size=64,
++        moe_intermediate_size=70,
++        gpu_experts_mask=torch.zeros(4, dtype=torch.bool),
++        cpuinfer_threads=4,
++        threadpool_count=1,
++        weight_path="/unused",
++        chunked_prefill_size=32,
++        cpu_save=False,
++        max_deferred_experts_per_token=0,
++        method=method,
++        activation=activation,
++    )
++
++
++def test_gelu_tanh_is_forwarded_for_bf16(monkeypatch):
++    wrapper = _create(monkeypatch, activation="gelu_pytorch_tanh")
++    assert wrapper.kwargs["activation"] == "gelu_pytorch_tanh"
++
++
++def test_silu_remains_the_bf16_default(monkeypatch):
++    wrapper = _create(monkeypatch)
++    assert wrapper.kwargs["activation"] == "silu"
++
++
++def test_gelu_tanh_rejected_for_non_bf16(monkeypatch):
++    with pytest.raises(ValueError, match="only with method='BF16'"):
++        _create(monkeypatch, method="MXFP4", activation="gelu_pytorch_tanh")
++
++
++def test_unknown_activation_rejected(monkeypatch):
++    with pytest.raises(ValueError, match="Unsupported activation"):
++        _create(monkeypatch, activation="gelu_exact")
+diff --git a/kt-kernel/test/per_commit/test_bf16_loader_gemma4.py b/kt-kernel/test/per_commit/test_bf16_loader_gemma4.py
+new file mode 100644
+index 0000000..610f9ea
+--- /dev/null
++++ b/kt-kernel/test/per_commit/test_bf16_loader_gemma4.py
+@@ -0,0 +1,73 @@
++"""Regression coverage for Gemma 4 packed BF16 expert checkpoints."""
++
++import os
++import sys
++import unittest
++
++import torch
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++from ci.ci_register import register_cpu_ci
++
++register_cpu_ci(est_time=5, suite="default")
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "python", "utils"))
++import loader
++
++BF16SafeTensorLoader = loader.BF16SafeTensorLoader
++
++
++class _StubBF16Loader(BF16SafeTensorLoader):
++    def __init__(self, tensors):
++        self._tensors = tensors
++        self.tensor_file_map = {key: "stub.safetensors" for key in tensors}
++        self.file_handle_map = {}
++        self.tensor_type_map = {}
++        self.tensor_device_map = {}
++        self._detected_format = None
++        self._detect_format()
++
++    def load_tensor(self, key: str, device: str = "cpu"):
++        tensor = self._tensors[key]
++        return tensor if device == "cpu" else tensor.to(device)
++
++
++def _packed_tensors(prefix):
++    gate_up = torch.arange(2 * 6 * 4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 6, 4)
++    down = torch.arange(2 * 4 * 3, dtype=torch.float32).to(torch.bfloat16).reshape(2, 4, 3)
++    return {
++        f"{prefix}.gate_up_proj": gate_up,
++        f"{prefix}.down_proj": down,
++    }
++
++
++class TestGemma4PackedBF16Loader(unittest.TestCase):
++    def test_detects_and_loads_direct_gemma4_prefix(self):
++        prefix = "model.language_model.layers.0.experts"
++        tensors = _packed_tensors(prefix)
++        stub = _StubBF16Loader(tensors)
++
++        self.assertEqual(stub._detected_format, "packed")
++        weights = stub.load_experts("model.language_model.layers.0")
++
++        self.assertEqual(len(weights["gate"]), 2)
++        self.assertEqual(tuple(weights["gate"][0].shape), (3, 4))
++        self.assertEqual(tuple(weights["up"][0].shape), (3, 4))
++        self.assertEqual(tuple(weights["down"][0].shape), (4, 3))
++        torch.testing.assert_close(
++            weights["gate"][0], tensors[f"{prefix}.gate_up_proj"][0, :3]
++        )
++
++    def test_resolves_model_layers_through_language_model(self):
++        prefix = "model.language_model.layers.7.experts"
++        tensors = _packed_tensors(prefix)
++        stub = _StubBF16Loader(tensors)
++
++        weights = stub.load_experts("model.layers.7")
++
++        torch.testing.assert_close(weights["gate"][1], tensors[f"{prefix}.gate_up_proj"][1, :3])
++        torch.testing.assert_close(weights["up"][1], tensors[f"{prefix}.gate_up_proj"][1, 3:])
++        torch.testing.assert_close(weights["down"][1], tensors[f"{prefix}.down_proj"][1])
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/kt-kernel/test/per_commit/test_moe_avx2_bf16_geglu.py b/kt-kernel/test/per_commit/test_moe_avx2_bf16_geglu.py
+new file mode 100644
+index 0000000..d7dcd51
+--- /dev/null
++++ b/kt-kernel/test/per_commit/test_moe_avx2_bf16_geglu.py
+@@ -0,0 +1,124 @@
++#!/usr/bin/env python
++"""Numerical parity for Gemma 4 AVX2 BF16 GeGLU."""
++
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
++
++import pytest
++import torch
++import torch.nn.functional as F
++from kt_kernel import kt_kernel_ext
++
++
++EXPERTS = 4
++HIDDEN = 64
++INTERMEDIATE = 70  # exercises both 8-lane AVX2 and the scalar tail
++TOP_K = 2
++MAX_LEN = 32
++CPU_THREADS = 8
++
++
++def _torch_moe(x, expert_ids, route_weights, gate, up, down, activation="gelu_tanh"):
++    out = torch.zeros((x.shape[0], HIDDEN), dtype=torch.float32)
++    for token_idx in range(x.shape[0]):
++        for route_idx in range(TOP_K):
++            expert = int(expert_ids[token_idx, route_idx])
++            gate_out = x[token_idx].float() @ gate[expert].float().t()
++            up_out = x[token_idx].float() @ up[expert].float().t()
++            if activation == "gelu_tanh":
++                hidden = F.gelu(gate_out, approximate="tanh") * up_out
++            elif activation == "silu":
++                hidden = F.silu(gate_out) * up_out
++            else:
++                raise AssertionError(f"unexpected activation: {activation}")
++            expert_out = hidden @ down[expert].float().t()
++            out[token_idx] += route_weights[token_idx, route_idx] * expert_out
++    return out.to(torch.bfloat16)
++
++
++@pytest.mark.cpu
++@pytest.mark.parametrize("qlen", [1, 13])
++def test_avx2_bf16_gelu_tanh_accuracy(qlen):
++    torch.manual_seed(20260828 + qlen)
++    mapping = torch.arange(EXPERTS, dtype=torch.int64).contiguous()
++    cpu_infer = kt_kernel_ext.CPUInfer(CPU_THREADS)
++
++    gate = (
++        torch.randn(EXPERTS, INTERMEDIATE, HIDDEN) * 0.25
++    ).to(torch.bfloat16).contiguous()
++    up = (
++        torch.randn(EXPERTS, INTERMEDIATE, HIDDEN) * 0.10
++    ).to(torch.bfloat16).contiguous()
++    down = (
++        torch.randn(EXPERTS, HIDDEN, INTERMEDIATE) * 0.10
++    ).to(torch.bfloat16).contiguous()
++
++    config = kt_kernel_ext.moe.MOEConfig(
++        EXPERTS, TOP_K, HIDDEN, INTERMEDIATE, 0
++    )
++    config.max_len = MAX_LEN
++    config.gate_proj = gate.data_ptr()
++    config.up_proj = up.data_ptr()
++    config.down_proj = down.data_ptr()
++    config.gate_scale = 0
++    config.up_scale = 0
++    config.down_scale = 0
++    config.pool = cpu_infer.backend_
++    config.activation_type = 1
++
++    moe = kt_kernel_ext.moe.AVX2BF16_MOE(config)
++    cpu_infer.submit(moe.load_weights_task(mapping.data_ptr()))
++    cpu_infer.sync()
++
++    expert_ids = torch.stack(
++        [torch.randperm(EXPERTS)[:TOP_K] for _ in range(qlen)]
++    ).to(torch.int64).contiguous()
++    route_weights = torch.rand(qlen, TOP_K, dtype=torch.float32).contiguous()
++    # Keep gate values away from zero so a stale SiLU implementation cannot
++    # accidentally pass merely because SiLU(x) and GELU(x) both approach x/2.
++    x = (torch.randn(qlen, HIDDEN) * 0.40).to(torch.bfloat16).contiguous()
++    output = torch.empty(qlen, HIDDEN, dtype=torch.bfloat16).contiguous()
++    batch_size = torch.tensor([qlen], dtype=torch.int32)
++
++    cpu_infer.submit(
++        moe.forward_task(
++            batch_size.data_ptr(),
++            TOP_K,
++            expert_ids.data_ptr(),
++            route_weights.data_ptr(),
++            x.data_ptr(),
++            output.data_ptr(),
++            False,
++        )
++    )
++    cpu_infer.sync()
++
++    reference = _torch_moe(x, expert_ids, route_weights, gate, up, down)
++    silu_reference = _torch_moe(
++        x, expert_ids, route_weights, gate, up, down, activation="silu"
++    )
++    abs_error = (output.float() - reference.float()).abs()
++    rel_l1 = abs_error.mean() / (reference.float().abs().mean() + 1e-8)
++    silu_rel_l1 = (
++        (output.float() - silu_reference.float()).abs().mean()
++        / (reference.float().abs().mean() + 1e-8)
++    )
++    cosine = F.cosine_similarity(
++        output.float().reshape(1, -1), reference.float().reshape(1, -1)
++    ).item()
++
++    assert rel_l1.item() < 0.025, (
++        f"relative L1 error too high: {rel_l1.item():.6f}"
++    )
++    assert cosine > 0.999, f"cosine similarity too low: {cosine:.8f}"
++    assert rel_l1.item() < silu_rel_l1.item() * 0.5, (
++        "output is not materially closer to GeGLU than SiLU: "
++        f"gelu_rel_l1={rel_l1.item():.6f}, silu_rel_l1={silu_rel_l1.item():.6f}"
++    )
++
++
++def test_activation_type_defaults_to_silu():
++    config = kt_kernel_ext.moe.MOEConfig(1, 1, 8, 8, 0)
++    assert config.activation_type == 0

@@ -36,6 +36,9 @@ from pathlib import Path
 
 ROOT = (Path(sys.argv[1]) if len(sys.argv) > 1 else
         Path.home() / "KTransformers/source/ktransformers-gemma4/kt-kernel") / "cpu_backend"
+if "memops_init" in (ROOT / "cpuinfer.h").read_text():
+    print("already patched cpuinfer.h")
+    raise SystemExit(0)
 TIMED = "int timing_every = 0;" in (ROOT / "task_queue.h").read_text()
 
 

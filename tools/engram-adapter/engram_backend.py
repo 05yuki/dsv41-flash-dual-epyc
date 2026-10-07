@@ -71,6 +71,23 @@ _cuda.cudaLaunchHostFunc.restype = C.c_int
 
 DIM, SCALES, BLOCK = 256, 8, 32
 
+# Lookups of at least this many rows (24 a token: n-grams 2..4 x 8 heads) are
+# prefill-sized and share one staging set per device that is rebuilt larger
+# when needed. Below it each power-of-two capacity keeps its own set, because
+# the decode CUDA graphs captured those pointers. Before 10-06 every capacity
+# kept its own set, so prefills of new lengths piled up device and pinned host
+# buffers (170 MiB a rank after a 38K prompt) that were never used again.
+EAGER_ROWS = int(os.environ.get("DSV41_ENGRAM_EAGER_ROWS", str(1 << 14)))
+
+
+def _lend_prefill() -> bool:
+    """True inside a KT prefill-lend window, when the lend scratch is resident."""
+    try:
+        from sglang.srt.layers.moe import kt_lend
+    except ImportError:
+        return False
+    return kt_lend.ENABLED and kt_lend.STATE.get("phase") == "prefill"
+
 
 def _stats(store) -> dict:
     buf = (U * 9)()
@@ -173,18 +190,57 @@ def install(module):
         if not count:
             return self._empty(indices)
         capacity = 1 << (count - 1).bit_length()
-        key = (indices.device.index, capacity)
-        if key not in self._staging:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(f"engram staging {key} must be warmed before graph capture")
-            ids = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
-            w = torch.empty((capacity, DIM), dtype=torch.uint8, pin_memory=True)
-            s = torch.empty((capacity, SCALES), dtype=torch.uint8, pin_memory=True)
-            dw, ds = w.to(indices.device), s.to(indices.device)
-            seq = torch.arange(capacity, dtype=torch.int64, device=indices.device)
-            self._staging[key] = (ids, w, s, dw, ds, seq)
+        dev = indices.device.index
+        if capacity >= EAGER_ROWS and not torch.cuda.is_current_stream_capturing():
+            # inside a lend window the set lives in the lend scratch (no VRAM
+            # between prefills); outside one it is a plain allocation. The two
+            # never mix: the scratch set is unmapped outside the window.
+            lent = _lend_prefill()
+            key = (dev, "eager-lend" if lent else "eager")
+            have = self._staging.get(key)
+            if have is None or have[0].numel() < capacity:
+                if have is not None:
+                    # host callbacks still queued hold the old Work and pinned rows
+                    torch.cuda.current_stream().synchronize()
+                    old = have[0].data_ptr()
+                    self._works = {k: v for k, v in self._works.items() if v.ids != old}
+                    del self._staging[key], have
+                from contextlib import nullcontext
+
+                region = nullcontext()
+                if lent:
+                    from sglang.srt.layers.moe import kt_lend
+
+                    region = kt_lend.scratch_region()
+                ids = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
+                w = torch.empty((capacity, DIM), dtype=torch.uint8, pin_memory=True)
+                s = torch.empty((capacity, SCALES), dtype=torch.uint8, pin_memory=True)
+                # dw / ds are rewritten by every lookup before the gather reads
+                # them, so the scratch may lose their contents between windows;
+                # seq is written once and must not live there
+                with region:
+                    dw = torch.empty((capacity, DIM), dtype=torch.uint8, device=indices.device)
+                    ds = torch.empty((capacity, SCALES), dtype=torch.uint8, device=indices.device)
+                seq = torch.arange(capacity, dtype=torch.int64, device=indices.device)
+                self._staging[key] = (ids, w, s, dw, ds, seq)
+        else:
+            key = (dev, capacity)
+            if key not in self._staging:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(f"engram staging {key} must be warmed before graph capture")
+                ids = torch.empty(capacity, dtype=torch.int64, pin_memory=True)
+                w = torch.empty((capacity, DIM), dtype=torch.uint8, pin_memory=True)
+                s = torch.empty((capacity, SCALES), dtype=torch.uint8, pin_memory=True)
+                dw, ds = w.to(indices.device), s.to(indices.device)
+                seq = torch.arange(capacity, dtype=torch.int64, device=indices.device)
+                self._staging[key] = (ids, w, s, dw, ds, seq)
         ids, w, s, dw, ds, seq = self._staging[key]
-        wk = (indices.device.index, count)
+        wk = (dev, ids.data_ptr(), count)
+        if wk not in self._works and len(self._works) >= 256:
+            # every prompt's last chunk is a new count; drop the prefill-sized
+            # ones once their callbacks have run (the decode ones stay)
+            torch.cuda.current_stream().synchronize()
+            self._works = {k: v for k, v in self._works.items() if k[2] < EAGER_ROWS}
         if wk not in self._works:
             self._works[wk] = Work(self._store, ids.data_ptr(), w.data_ptr(), s.data_ptr(), count)
         work = self._works[wk]

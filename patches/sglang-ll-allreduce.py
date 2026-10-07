@@ -171,6 +171,9 @@ print("wrote ll_allreduce.py")
 
 F = ROOT / "parallel_state.py"
 s = F.read_text()
+if "self.ll_comm = None" in s:
+    print("already patched parallel_state.py")
+    raise SystemExit(0)
 
 
 def once(old, new, text):
