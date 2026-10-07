@@ -27,7 +27,7 @@ bought.
 | prefill, ~114K tokens | — | — | 114,166 tokens in 441 s (259 tok/s, 10-05) | 114,162 tokens in **191.6 s** (596 tok/s) |
 | prefill at depth 0 / 29k / 64k / 128k | — | — | 242 / 249 / 185 / 211 tok/s | — |
 | prefill chunk | 2048 | 2048 | 2048 | 6144, the widest that keeps the KV pool; calibrated with the lend probe up to 1M |
-| startup (476 GB loaded and pinned) | — | 60+ min | 11 min | **351 s** cold (740 s this morning; finding 18); a setup's first launch adds one calibration launch (the probe itself takes 2 min) |
+| startup (476 GB loaded and pinned) | — | 60+ min | 11 min | **351 s** cold |
 | context | 1M | 1M | 1M (the ladder ran at a 262K pool with radix on) | 1M, KV pool 1,048,576 tokens; a 989,154-token prompt prefills in **2,433.9 s** (406 tok/s, the first prefill after a launch) |
 
 ¹ With four of the six routed experts per token deferred (the launcher's
