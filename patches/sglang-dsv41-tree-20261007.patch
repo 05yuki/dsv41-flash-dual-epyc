@@ -2107,10 +2107,10 @@ index 00000000..c0430910
 +    logger.info("kt-lend probe: done in %.1f s", time.perf_counter() - t_all)
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 new file mode 100644
-index 00000000..020d0cfe
+index 00000000..042bb757
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-@@ -0,0 +1,1518 @@
+@@ -0,0 +1,1522 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""GPU-streamed prefill for the KT EP wrapper: expert groups over PCIe.
 +
@@ -2480,7 +2480,10 @@ index 00000000..020d0cfe
 +        # Per-expert constants the runner reads, sized G like the resident
 +        # method sizes its own (Mxfp4FlashinferCutlassMoEMethod.create_moe_runner).
 +        gm = method.gpu_method
-+        lim_value = getattr(gm, "_swiglu_limit_value", None)
++        runner_config = getattr(gm, "moe_runner_config", None)
++        lim_value = getattr(runner_config, "swiglu_limit", None)
++        if lim_value is None:
++            lim_value = getattr(gm, "_swiglu_limit_value", None)
 +        if lim_value is None:
 +            lim = getattr(gm, "_swiglu_limit_tensor", None)
 +            lim_value = None if lim is None or lim.numel() == 0 else float(lim[0])
@@ -2985,6 +2988,7 @@ index 00000000..020d0cfe
 +                output_dtype=torch.bfloat16,
 +                quant_scales=None,
 +                input_sf=None,
++                swiglu_limit=None if self.swiglu_limit is None else self.swiglu_limit[:n],
 +                tp_size=layer.moe_tp_size,
 +                tp_rank=layer.moe_tp_rank,
 +                ep_size=layer.moe_ep_size,
