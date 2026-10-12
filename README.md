@@ -373,6 +373,14 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
    `sglang-dsv4-load-skip-cpu-experts.py`, `sglang-dense-prefetch.py`, each
    with the tree as its argument. That gives the same files V4.1 runs; the 10-07
    patch adds the Vision path.
+   The 10-07 tree also propagates the runner's SwiGLU clamp to streamed expert
+   groups, including the BF16 CUTLASS call. This matters for Marlin, which stores
+   the clamp in `moe_runner_config`, rather than the legacy CUTLASS attributes.
+   `python tools/test-stream-swiglu-clamp.py` checks the bundled source without
+   Torch/CUDA; `--source /path/to/kt_stream_prefill.py` checks an installed tree.
+   The optional `python tools/test-stream-swiglu-clamp-cuda.py` checks the BF16
+   CUTLASS primitive on each visible GPU without loading the model: the saturating
+   fixture produces 600 without the clamp and 100 with limit 10.
 2. kvcache-ai/ktransformers at 95009ea with
    `patches/kt-kernel-tree-20261006.patch` (`git apply`; the submodules
    `third_party/llama.cpp` and `third_party/pybind11` at that commit's
