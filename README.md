@@ -374,8 +374,10 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
    with the tree as its argument. That gives the same files V4.1 runs; the 10-07
    patch adds the Vision path.
    The 10-07 tree also propagates the runner's SwiGLU clamp to streamed expert
-   groups, including the BF16 CUTLASS call. This matters for Marlin, which stores
-   the clamp in `moe_runner_config`, rather than the legacy CUTLASS attributes.
+   groups, including the BF16 CUTLASS call. Under Marlin the GPU method
+   (`Mxfp4MarlinMoEMethod`) has neither the legacy CUTLASS attributes nor a
+   `moe_runner_config` of its own, so the lookup starts from the layer's
+   `moe_runner_config`.
    `python tools/test-stream-swiglu-clamp.py` checks the bundled source without
    Torch/CUDA; `--source /path/to/kt_stream_prefill.py` checks an installed tree.
    The optional `python tools/test-stream-swiglu-clamp-cuda.py` checks the BF16

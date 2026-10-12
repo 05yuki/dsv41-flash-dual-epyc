@@ -37,7 +37,7 @@ class StreamClampTest(unittest.TestCase):
             if isinstance(node, ast.ClassDef) and node.name == "KTStreamPrefill"
         )
 
-    def resolve(self, gpu_method):
+    def resolve(self, gpu_method, layer_config=None):
         initializer = next(
             node
             for node in self.streamer.body
@@ -63,6 +63,7 @@ class StreamClampTest(unittest.TestCase):
             compile(policy, "stream-clamp-policy", "exec"),
             {
                 "method": SimpleNamespace(gpu_method=gpu_method),
+                "layer": SimpleNamespace(moe_runner_config=layer_config),
                 "self": target,
                 "torch": fake_torch,
             },
@@ -79,6 +80,18 @@ class StreamClampTest(unittest.TestCase):
             _swiglu_limit_value=7.0,
         )
         self.assertEqual(self.resolve(method), 10.0)
+
+    def test_marlin_method_has_no_config(self):
+        # Mxfp4MarlinMoEMethod keeps the config inside its runner only; the
+        # layer's moe_runner_config is the source that always exists.
+        layer_config = SimpleNamespace(swiglu_limit=10.0)
+        self.assertEqual(self.resolve(SimpleNamespace(), layer_config), 10.0)
+
+    def test_layer_configuration_takes_precedence(self):
+        method = SimpleNamespace(_swiglu_limit_value=7.0)
+        self.assertEqual(
+            self.resolve(method, SimpleNamespace(swiglu_limit=10.0)), 10.0
+        )
 
     def test_legacy_scalar(self):
         self.assertEqual(self.resolve(SimpleNamespace(_swiglu_limit_value=7.0)), 7.0)

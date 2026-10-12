@@ -2111,10 +2111,10 @@ index 00000000..c0430910
 +    logger.info("kt-lend probe: done in %.1f s", time.perf_counter() - t_all)
 diff --git a/python/sglang/srt/layers/moe/kt_stream_prefill.py b/python/sglang/srt/layers/moe/kt_stream_prefill.py
 new file mode 100644
-index 00000000..042bb757
+index 00000000..6c42d5c3
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/kt_stream_prefill.py
-@@ -0,0 +1,1522 @@
+@@ -0,0 +1,1527 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""GPU-streamed prefill for the KT EP wrapper: expert groups over PCIe.
 +
@@ -2484,7 +2484,12 @@ index 00000000..042bb757
 +        # Per-expert constants the runner reads, sized G like the resident
 +        # method sizes its own (Mxfp4FlashinferCutlassMoEMethod.create_moe_runner).
 +        gm = method.gpu_method
-+        runner_config = getattr(gm, "moe_runner_config", None)
++        # The layer's runner config first: under --moe-runner-backend marlin
++        # the GPU method is Mxfp4MarlinMoEMethod, which keeps the config only
++        # inside its runner and has none of the attributes below.
++        runner_config = getattr(layer, "moe_runner_config", None)
++        if runner_config is None:
++            runner_config = getattr(gm, "moe_runner_config", None)
 +        lim_value = getattr(runner_config, "swiglu_limit", None)
 +        if lim_value is None:
 +            lim_value = getattr(gm, "_swiglu_limit_value", None)
