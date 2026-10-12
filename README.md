@@ -381,6 +381,11 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
    The optional `python tools/test-stream-swiglu-clamp-cuda.py` checks the BF16
    CUTLASS primitive on each visible GPU without loading the model: the saturating
    fixture produces 600 without the clamp and 100 with limit 10.
+   The CPU experts get the same clamp: the wrapper passes
+   `moe_runner_config.swiglu_limit` to `KTMoEWrapper`, whose default 0.0 left
+   kt-kernel's MXFP4 experts (decode, short prefill) unclamped. kt-kernel applies
+   it in the AVX2 activation as the model does: gate <= limit, |up| <= limit,
+   then silu(gate) * up. (The same change upstream: sgl-project/sglang#43500.)
 2. kvcache-ai/ktransformers at 95009ea with
    `patches/kt-kernel-tree-20261006.patch` (`git apply`; the submodules
    `third_party/llama.cpp` and `third_party/pybind11` at that commit's
