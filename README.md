@@ -388,6 +388,17 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
    kt-kernel's MXFP4 experts (decode, short prefill) unclamped. kt-kernel applies
    it in the AVX2 activation as the model does: gate <= limit, |up| <= limit,
    then silu(gate) * up. (The same change upstream: sgl-project/sglang#43500.)
+   Zero resident experts (`--kt-num-gpu-experts 0`) skip GPU-only weight
+   postprocessing as well as the resident expert kernel. CPU weight loading and
+   early streamed-prefill initialization still run. This avoids Marlin's
+   `stack expects a non-empty TensorList` error when repacking empty weights.
+   Check the patched wrapper without Torch, CUDA or model weights:
+
+   ```sh
+   python tools/test-zero-resident-experts.py \
+     --source /path/to/sglang/python/sglang/srt/layers/moe/kt_ep_wrapper.py
+   ```
+
 2. kvcache-ai/ktransformers at 95009ea with
    `patches/kt-kernel-tree-20261006.patch` (`git apply`; the submodules
    `third_party/llama.cpp` and `third_party/pybind11` at that commit's
