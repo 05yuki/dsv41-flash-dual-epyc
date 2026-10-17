@@ -383,6 +383,15 @@ named `"GPU"`; `"CUDA"` is silently ignored and records no kernels.
    The optional `python tools/test-stream-swiglu-clamp-cuda.py` checks the BF16
    CUTLASS primitive on each visible GPU without loading the model: the saturating
    fixture produces 600 without the clamp and 100 with limit 10.
+   SM120 page conversion also clears its reserved padding page before touched-page
+   filtering. FlashInfer gathers masked values from entry 0, so uninitialized
+   padding can poison attention through `0 * NaN`, even with finite real KV pages.
+   `python tools/test-sm120-padding.py --source /path/to/flash_mla_sm120.py`
+   checks the actual patched Triton branch with NumPy, without Torch/CUDA.
+   The optional `python tools/test-sm120-padding-cuda.py` checks primary and
+   compressed-extra attention against deliberately poisoned scratch on every
+   visible SM120 GPU, including graph replay. It needs no model weights; run it
+   outside timed serving measurements.
    The CPU experts get the same clamp: the wrapper passes
    `moe_runner_config.swiglu_limit` to `KTMoEWrapper`, whose default 0.0 left
    kt-kernel's MXFP4 experts (decode, short prefill) unclamped. kt-kernel applies
