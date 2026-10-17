@@ -1,5 +1,5 @@
 diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-index 906d4aa2..3cb86e24 100644
+index 906d4aa2..c1277761 100644
 --- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 +++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 @@ -246,6 +246,33 @@ def _flash_mla_sm120_prefill(
@@ -36,7 +36,28 @@ index 906d4aa2..3cb86e24 100644
      output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
      out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
      _sparse_mla_sm120_paged_attention(
-@@ -449,6 +476,7 @@ def _split_kv_pages_to_64(
+@@ -391,6 +418,20 @@ def _page_split_kernel(
+     if page_idx >= N_pages:
+         return
+ 
++    # SGLang's paged allocator reserves page 0 for padding. FlashInfer maps
++    # negative indices to entry 0 before masking scores; a masked NaN value
++    # still poisons XV (0 * NaN). The touched-page optimization otherwise
++    # leaves this scratch page uninitialized, or copies dummy-token garbage.
++    # Clear it on every conversion, including captured replays, without an
++    # extra launch. Other sub-pages keep their existing conversion behavior.
++    if pid == 0:
++        sentinel = dst_ptr.to(tl.pointer_type(tl.uint64))
++        for start in tl.range(0, dst_stride0 // 8, BLOCK_SIZE):
++            offs = start + tl.arange(0, BLOCK_SIZE)
++            tl.store(sentinel + offs, tl.full((BLOCK_SIZE,), 0, tl.uint64),
++                     mask=offs < dst_stride0 // 8)
++        return
++
+     if HAS_MASK:
+         if tl.load(mask_ptr + page_idx) == 0:
+             return
+@@ -449,6 +490,7 @@ def _split_kv_pages_to_64(
      kv_u8: torch.Tensor,
      src_pbs: int,
      touched_indices: Optional[torch.Tensor] = None,
@@ -44,7 +65,7 @@ index 906d4aa2..3cb86e24 100644
  ) -> torch.Tensor:
      """Split pbs=N footer-format pages into pbs=64 footer-format pages.
  
-@@ -472,7 +500,7 @@ def _split_kv_pages_to_64(
+@@ -472,7 +514,7 @@ def _split_kv_pages_to_64(
      # Pre-allocated grow-only buffer for page-split output per device.
      dev = kv_u8.device
      buffers = get_resources().buffers
@@ -53,7 +74,7 @@ index 906d4aa2..3cb86e24 100644
      buf = buffers.get(key)
      if buf is None or buf.shape[0] < num_dst_pages:
          # The first allocation can happen under inference mode (autotune), but
-@@ -501,7 +529,7 @@ def _split_kv_pages_to_64(
+@@ -501,7 +543,7 @@ def _split_kv_pages_to_64(
      if use_mask:
          # Persistent per-device int8 mask, zeroed each call (cheap memset,
          # captured cleanly by CUDA graph). 1 = page is referenced this step.
